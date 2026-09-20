@@ -133,6 +133,16 @@ def test_flushing_stream_handler_flushes() -> None:
     assert "hello-flush" in buf.getvalue()
 
 
+@pytest.mark.asyncio
+async def test_solana_stub_refuses_submit() -> None:
+    stub = main.SolanaLiquidationStub("", logging.getLogger("test"))
+    assert await stub.fetch_liquidatable(2.0) == []
+    pos = main.SolanaPosition("ob", "repay", "withdraw", 1)
+    assert await stub.simulate_liquidate(pos) is False
+    with pytest.raises(RuntimeError, match="stubbed"):
+        await stub.submit_liquidate(pos)
+
+
 def test_config_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ETH_RPC_URL", raising=False)
     monkeypatch.delenv("EVM_ADDRESS", raising=False)

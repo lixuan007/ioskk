@@ -33,7 +33,7 @@ cp .env.example .env
 python main.py
 ```
 
-With no `START_BLOCK`, the process polls new heads (or subscribes if `ETH_WS_URL` / `BNB_WS_URL` is set), reads protocol logs for known pools only, prefilters by `MIN_USD`, and simulates official `liquidationCall` / `liquidateBorrow`.
+With no `START_BLOCK`, the process follows new heads (WebSocket `newHeads` when `ETH_WS_URL` / `BNB_WS_URL` is set, otherwise HTTP poll), reads protocol logs for known pools only, prefilters by `MIN_USD`, and simulates official `liquidationCall` / `liquidateBorrow`.
 
 Historical backfill:
 

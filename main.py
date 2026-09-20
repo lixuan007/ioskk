@@ -30,7 +30,7 @@ from eth_utils import (
     to_checksum_address,
 )
 from web3 import AsyncWeb3
-from web3.exceptions import Web3Exception
+from web3.providers.persistent import WebSocketProvider
 from web3.providers.rpc import AsyncHTTPProvider
 from web3.types import HexBytes, TxParams
 
@@ -1178,19 +1178,69 @@ class MarketScanner:
         end = min(end, head)
         await self.scan_range(start, end)
 
+    async def _handle_new_head(self, last: int, head: int) -> int:
+        if head <= last:
+            return last
+        from_block = max(0, last + 1 - self.config.live_lookback_blocks)
+        await self.scan_range(from_block, head)
+        return head
+
+    async def _run_live_ws(self, stop: asyncio.Event, last: int) -> int:
+        """newHeads subscription. HTTP get_logs still does the work; WS only signals heads."""
+        self._logger.info("%s subscribing newHeads on websocket", self.chain.name)
+        async with AsyncWeb3(WebSocketProvider(self.chain.ws_url)) as ws_w3:
+            await ws_w3.eth.subscribe("newHeads")
+            waiter = asyncio.create_task(stop.wait())
+            try:
+                async for msg in ws_w3.socket.process_subscriptions():
+                    if stop.is_set():
+                        break
+                    result = msg.get("result") if isinstance(msg, dict) else None
+                    number = None
+                    if isinstance(result, dict):
+                        number = result.get("number")
+                    if number is None:
+                        number = await self.chain.rpc(
+                            lambda: self.chain.w3.eth.block_number, label="block_number"
+                        )
+                    last = await self._handle_new_head(last, int(number))
+                    if waiter.done():
+                        break
+            finally:
+                if not waiter.done():
+                    waiter.cancel()
+                try:
+                    await waiter
+                except (asyncio.CancelledError, Exception):
+                    pass
+        return last
+
     async def run_live(self, stop: asyncio.Event) -> None:
         head = int(await self.chain.rpc(lambda: self.chain.w3.eth.block_number, label="block_number"))
         last = head
         self._logger.info("%s live from block %s", self.chain.name, last)
-        if self.chain.ws_url:
-            self._logger.info("%s ETH_WS/BNB_WS set; HTTP poll still used as the reliable path", self.chain.name)
         while not stop.is_set():
             try:
+                if self.chain.ws_url:
+                    try:
+                        last = await self._run_live_ws(stop, last)
+                        if stop.is_set():
+                            return
+                    except Exception as exc:
+                        if not is_transient_rpc_error(exc) and type(exc).__name__ not in {
+                            "WebSocketException",
+                            "ConnectionClosed",
+                            "ProviderConnectionError",
+                            "PersistentConnectionClosedOK",
+                        }:
+                            raise
+                        self._logger.warning(
+                            "%s newHeads websocket failed (%s), polling instead",
+                            self.chain.name,
+                            type(exc).__name__,
+                        )
                 head = int(await self.chain.rpc(lambda: self.chain.w3.eth.block_number, label="block_number"))
-                if head > last:
-                    from_block = max(0, last + 1 - self.config.live_lookback_blocks)
-                    await self.scan_range(from_block, head)
-                    last = head
+                last = await self._handle_new_head(last, head)
             except TransientRpcError:
                 self._logger.warning("%s live loop transient, retrying", self.chain.name)
             except Exception:
@@ -1273,7 +1323,7 @@ async def run_keeper(config: AppConfig, logger: logging.Logger) -> None:
         logger.info(
             "keeper start dry_run=%s operator=%s min_usd=%s concurrency=%s",
             config.dry_run,
-            operator or "<unset>',
+            operator or "<unset>",
             config.min_usd,
             config.concurrency,
         )
