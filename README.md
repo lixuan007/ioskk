@@ -24,7 +24,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env — RPC URLs, your EVM address, optional Telegram
+# edit .env — RPC URLs must be a JSON-RPC gateway (dRPC ogrpc), not bnbchain.org or etherscan.
 ```
 
 ## Dry-run (default)

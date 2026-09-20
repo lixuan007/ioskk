@@ -145,6 +145,37 @@ def test_env_bool_and_csv_addresses() -> None:
     assert addrs[0].startswith("0x")
 
 
+def test_html_rpc_body_is_classified_without_dumping_source() -> None:
+    html = "<!DOCTYPE html><html><head><title>BNB Chain</title></head><body>www.bnbchain.org</body></html>"
+    assert main.looks_like_html(html) is True
+    assert main.looks_like_non_json_rpc(html) is True
+    exc = RuntimeError("Could not decode " + html + " because of Expecting value")
+    assert main.classify_rpc_error(exc) == "html"
+    assert main.is_transient_rpc_error(exc) is True
+    hint = main.short_rpc_hint("【BNB 链】", "html")
+    assert hint == "【BNB 链】收到网页而非 JSON-RPC，请检查 BNB_RPC_URL"
+    assert "<!DOCTYPE" not in hint
+    assert "bnbchain.org" not in hint
+    assert main.short_rpc_hint("【ETH 链】", "ratelimit") == "【ETH 链】请求过于频繁(429)，将重连"
+    assert main.classify_rpc_error(main.NonJsonRpcError("html")) == "html"
+
+
+def test_omit_html_log_filter_drops_webpage_records() -> None:
+    filt = main.OmitHtmlLogFilter()
+    html_rec = logging.LogRecord(
+        "web3",
+        logging.ERROR,
+        __file__,
+        1,
+        "Could not decode %s",
+        ("<!DOCTYPE html><html>next</html>",),
+        None,
+    )
+    ok_rec = logging.LogRecord("keeper", logging.INFO, __file__, 1, "【BNB 链】区块高度 1", None, None)
+    assert filt.filter(html_rec) is False
+    assert filt.filter(ok_rec) is True
+
+
 def test_transient_vs_revert_classifier() -> None:
     class ContractLogicError(Exception):
         pass

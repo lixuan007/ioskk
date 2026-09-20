@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Final, Iterable, Protocol
@@ -32,7 +33,7 @@ from eth_utils import (
 from web3 import AsyncWeb3
 from web3.providers.persistent import WebSocketProvider
 from web3.providers.rpc import AsyncHTTPProvider
-from web3.types import HexBytes, TxParams
+from web3.types import HexBytes, RPCEndpoint, TxParams
 
 try:
     from dotenv import load_dotenv
@@ -305,7 +306,7 @@ def csv_addresses(raw: str) -> list[str]:
 
 def is_execution_revert(exc: BaseException) -> bool:
     name = type(exc).__name__.lower()
-    msg = str(exc).lower()
+    msg = _exc_head(exc).lower()
     return (
         "revert" in msg
         or "execution reverted" in msg
@@ -313,10 +314,76 @@ def is_execution_revert(exc: BaseException) -> bool:
     )
 
 
-def is_transient_rpc_error(exc: BaseException) -> bool:
-    """Network / 429 / non-JSON: reconnect and continue. Not used for logic bugs."""
-    if is_execution_revert(exc):
+def _exc_head(exc: BaseException, limit: int = 400) -> str:
+    """First characters of an exception only — never the full HTML body."""
+    try:
+        text = str(exc)
+    except Exception:
+        return type(exc).__name__
+    return text[:limit]
+
+
+def body_head(raw: Any, limit: int = 240) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        chunk = bytes(raw[:limit])
+        return chunk.decode("utf-8", errors="replace")
+    return str(raw)[:limit]
+
+
+def looks_like_html(text: str) -> bool:
+    sample = text.lstrip().lower()
+    return (
+        sample.startswith("<!doctype")
+        or sample.startswith("<html")
+        or "<!doctype html" in sample
+        or sample.startswith("<head")
+        or "<html" in sample[:160]
+    )
+
+
+def looks_like_non_json_rpc(text: str) -> bool:
+    sample = text.lstrip()
+    if not sample:
         return False
+    if looks_like_html(sample):
+        return True
+    if sample[0] in "{[":
+        return False
+    lowered = sample.lower()
+    return (
+        "expecting value" in lowered
+        or "not valid json" in lowered
+        or "could not decode" in lowered
+        or "badresponseformat" in lowered
+    )
+
+
+class NonJsonRpcError(RuntimeError):
+    """JSON-RPC endpoint returned HTML or other non-JSON. Message never includes the body."""
+
+    def __init__(self, kind: str = "nonjson") -> None:
+        self.kind = kind
+        super().__init__(kind)
+
+
+def rpc_url_env_for_alias(alias: str) -> str:
+    if "ETH" in alias:
+        return "ETH_RPC_URL"
+    if "BNB" in alias:
+        return "BNB_RPC_URL"
+    if "SOL" in alias:
+        return "SOL_RPC_URL"
+    return "RPC_URL"
+
+
+def classify_rpc_error(exc: BaseException) -> str | None:
+    """html | nonjson | ratelimit | transient, or None for logic/revert."""
+    if is_execution_revert(exc):
+        return None
+    if isinstance(exc, NonJsonRpcError):
+        return exc.kind if exc.kind in {"html", "nonjson"} else "nonjson"
     if isinstance(
         exc,
         (
@@ -328,20 +395,27 @@ def is_transient_rpc_error(exc: BaseException) -> bool:
             OSError,
         ),
     ):
-        return True
-    msg = str(exc).lower()
+        head = _exc_head(exc)
+        if looks_like_html(head):
+            return "html"
+        if isinstance(exc, json.JSONDecodeError) or looks_like_non_json_rpc(head):
+            return "nonjson"
+        if _is_rate_limit_text(head):
+            return "ratelimit"
+        return "transient"
+    head = _exc_head(exc)
+    if looks_like_html(head):
+        return "html"
+    if looks_like_non_json_rpc(head) or "badresponseformat" in head.lower():
+        return "nonjson"
+    if _is_rate_limit_text(head):
+        return "ratelimit"
     needles = (
-        "429",
-        "too many requests",
-        "rate limit",
         "timeout",
         "timed out",
         "connection",
         "reset by peer",
         "broken pipe",
-        "expecting value",
-        "not valid json",
-        "badresponseformat",
         "503",
         "502",
         "504",
@@ -352,11 +426,70 @@ def is_transient_rpc_error(exc: BaseException) -> bool:
         "econnreset",
         "eai_again",
     )
-    return any(needle in msg for needle in needles)
+    lowered = head.lower()
+    if any(needle in lowered for needle in needles):
+        return "transient"
+    return None
+
+
+def _is_rate_limit_text(text: str) -> bool:
+    lowered = text.lower()
+    return "429" in lowered or "too many requests" in lowered or "rate limit" in lowered
+
+
+def is_transient_rpc_error(exc: BaseException) -> bool:
+    """Network / 429 / HTML / non-JSON: reconnect and continue. Not used for logic bugs."""
+    return classify_rpc_error(exc) is not None
+
+
+def short_rpc_hint(alias: str, kind: str) -> str:
+    env_name = rpc_url_env_for_alias(alias)
+    if kind == "html":
+        return f"{alias}收到网页而非 JSON-RPC，请检查 {env_name}"
+    if kind == "nonjson":
+        return f"{alias}收到非 JSON 响应，请检查 {env_name}"
+    if kind == "ratelimit":
+        return f"{alias}请求过于频繁(429)，将重连"
+    return f"{alias}RPC 瞬时错误，将重连"
+
+
+def log_rpc_issue(
+    logger: logging.Logger,
+    alias: str,
+    kind: str,
+    seen: dict[tuple[str, str], float],
+    *,
+    cooldown_sec: float = 20.0,
+) -> None:
+    """One short Chinese line per chain/kind; never the HTML body."""
+    key = (alias, kind)
+    now = time.monotonic()
+    last = seen.get(key, 0.0)
+    if now - last < cooldown_sec:
+        return
+    seen[key] = now
+    logger.warning("%s", short_rpc_hint(alias, kind))
+
+
+class OmitHtmlLogFilter(logging.Filter):
+    """Drop records that embed webpage/HTML bodies so stdout cannot flood."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            record.msg = "log record omitted"
+            record.args = ()
+            return True
+        if looks_like_html(msg):
+            return False
+        if len(msg) > 400 and ("<html" in msg.lower() or "<!doctype" in msg.lower()):
+            return False
+        return True
 
 
 class TransientRpcError(RuntimeError):
-    """Raised after retries are exhausted on a transient RPC failure."""
+    """Raised after retries are exhausted on a transient RPC failure. Short text only."""
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +634,7 @@ FlushingFileHandler = RealtimeFileHandler
 
 
 def setup_logging(config: AppConfig) -> logging.Logger:
+    html_filter = OmitHtmlLogFilter()
     logger = logging.getLogger("keeper")
     logger.setLevel(getattr(logging, config.log_level, logging.INFO))
     logger.handlers.clear()
@@ -508,11 +642,16 @@ def setup_logging(config: AppConfig) -> logging.Logger:
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     stream = RealtimeStreamHandler(sys.stdout)
     stream.setFormatter(fmt)
+    stream.addFilter(html_filter)
     logger.addHandler(stream)
     if config.log_file:
         file_handler = RealtimeFileHandler(config.log_file, encoding="utf-8")
         file_handler.setFormatter(fmt)
+        file_handler.addFilter(html_filter)
         logger.addHandler(file_handler)
+    for name in ("web3", "web3.providers", "web3.providers.HTTPProvider", "aiohttp"):
+        noisy = logging.getLogger(name)
+        noisy.addFilter(html_filter)
     return logger
 
 
@@ -639,6 +778,8 @@ class SolanaLiquidationStub:
         self._rpc_url = rpc_url
         self._logger = logger
         self._client: Any = None
+        self._rpc_issue_seen: dict[tuple[str, str], float] = {}
+        self.alias = chain_alias("solana")
 
     async def connect(self) -> int:
         if not self._rpc_url:
@@ -654,8 +795,9 @@ class SolanaLiquidationStub:
             self._logger.info("[solana] 区块高度 %s (slot) 已连接 AsyncClient；公开清算 IDL 未接线", slot)
             return slot
         except Exception as exc:
-            if is_transient_rpc_error(exc):
-                self._logger.warning("[solana] 瞬时连接错误: %s", type(exc).__name__)
+            kind = classify_rpc_error(exc)
+            if kind is not None:
+                log_rpc_issue(self._logger, self.alias, kind, self._rpc_issue_seen)
                 return 0
             raise
 
@@ -694,8 +836,9 @@ class SolanaLiquidationStub:
                     )
                     last = slot
             except Exception as exc:
-                if is_transient_rpc_error(exc):
-                    self._logger.warning("[solana] 瞬时 RPC 错误: %s", type(exc).__name__)
+                kind = classify_rpc_error(exc)
+                if kind is not None:
+                    log_rpc_issue(self._logger, self.alias, kind, self._rpc_issue_seen)
                 else:
                     raise
             try:
@@ -707,6 +850,27 @@ class SolanaLiquidationStub:
 # ---------------------------------------------------------------------------
 # EVM RPC session
 # ---------------------------------------------------------------------------
+
+class SanitizingAsyncHTTPProvider(AsyncHTTPProvider):
+    """Decode JSON-RPC only. HTTP 200 HTML/non-JSON becomes NonJsonRpcError (no body)."""
+
+    async def make_request(self, method: RPCEndpoint, params: Any) -> Any:
+        self.logger.debug("Making request HTTP. Method: %s", method)
+        request_data = self.encode_rpc_request(method, params)
+        raw_response = await self._make_request(method, request_data)
+        head = body_head(raw_response)
+        if looks_like_html(head):
+            raise NonJsonRpcError("html")
+        if looks_like_non_json_rpc(head):
+            raise NonJsonRpcError("nonjson")
+        try:
+            return self.decode_rpc_response(raw_response)
+        except Exception as exc:
+            kind = classify_rpc_error(exc) or ("html" if looks_like_html(_exc_head(exc)) else "nonjson")
+            if kind in {"html", "nonjson"}:
+                raise NonJsonRpcError(kind) from None
+            raise
+
 
 class EvmChain:
     def __init__(
@@ -725,9 +889,10 @@ class EvmChain:
         self._logger = logger
         self.w3 = self._make_w3()
         self.chain_id: int | None = None
+        self._rpc_issue_seen: dict[tuple[str, str], float] = {}
 
     def _make_w3(self) -> AsyncWeb3:
-        provider = AsyncHTTPProvider(
+        provider = SanitizingAsyncHTTPProvider(
             self.rpc_url,
             request_kwargs={"timeout": 25},
         )
@@ -738,47 +903,42 @@ class EvmChain:
         if cache is not None:
             await cache(self._session)
 
+    def _log_rpc(self, kind: str) -> None:
+        log_rpc_issue(self._logger, self.alias, kind, self._rpc_issue_seen)
+
     async def reconnect(self) -> None:
-        self._logger.warning("%s rpc reconnect", self.alias)
         disconnect = getattr(self.w3.provider, "disconnect", None)
         if disconnect is not None:
             try:
                 result = disconnect()
                 if asyncio.iscoroutine(result):
                     await result
-            except Exception as exc:
-                self._logger.warning("%s provider disconnect: %s", self.alias, exc)
+            except Exception:
+                pass
         self.w3 = self._make_w3()
         await self.attach_session()
         self.chain_id = None
 
     async def rpc(self, factory: Any, *, attempts: int = 5, label: str = "rpc") -> Any:
         delay = 1.0
-        last: BaseException | None = None
+        last_kind = "transient"
         for attempt in range(1, attempts + 1):
             try:
                 return await factory()
             except Exception as exc:
-                last = exc
                 if is_execution_revert(exc):
                     raise
-                if not is_transient_rpc_error(exc):
+                kind = classify_rpc_error(exc)
+                if kind is None:
                     raise
-                self._logger.warning(
-                    "%s %s transient (%s/%s): %s",
-                    self.alias,
-                    label,
-                    attempt,
-                    attempts,
-                    type(exc).__name__,
-                )
+                last_kind = kind
+                self._log_rpc(kind)
                 if attempt == attempts:
                     break
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 16.0)
-                if attempt >= 2:
-                    await self.reconnect()
-        raise TransientRpcError(f"{self.name} {label} failed: {last}")
+                await self.reconnect()
+        raise TransientRpcError(short_rpc_hint(self.alias, last_kind))
 
 
 # ---------------------------------------------------------------------------
@@ -866,8 +1026,9 @@ class SimulationEngine:
                     position.user,
                 )
                 return False
-            if is_transient_rpc_error(exc):
-                self._logger.warning("%s 清算状态 模拟瞬时错误: %s", self.chain.alias, type(exc).__name__)
+            kind = classify_rpc_error(exc)
+            if kind is not None:
+                self.chain._log_rpc(kind)
                 return False
             raise
         self._logger.info(
@@ -1559,8 +1720,9 @@ class Keeper:
                 await sol.connect()
                 await sol.fetch_liquidatable(config.min_usd)
             except Exception as exc:
-                if is_transient_rpc_error(exc):
-                    logger.warning("[solana] 瞬时错误: %s", type(exc).__name__)
+                kind = classify_rpc_error(exc)
+                if kind is not None:
+                    log_rpc_issue(logger, chain_alias("solana"), kind, {})
                 else:
                     raise
 
