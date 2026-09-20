@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from unittest.mock import patch
 
 import pytest
@@ -222,6 +223,58 @@ async def test_solana_stub_refuses_submit() -> None:
     assert await stub.simulate_liquidate(pos) is False
     with pytest.raises(RuntimeError, match="stubbed"):
         await stub.submit_liquidate(pos)
+
+
+def test_parse_dotenv_quotes_comments_and_export() -> None:
+    text = """
+# comment
+ETH_RPC_URL="https://example.invalid/eth"
+BNB_RPC_URL='https://example.invalid/bnb'
+export SOL_RPC_URL=https://example.invalid/sol
+EMPTY=
+not_a_pair
+"""
+    parsed = main.parse_dotenv_text(text)
+    assert parsed["ETH_RPC_URL"] == "https://example.invalid/eth"
+    assert parsed["BNB_RPC_URL"] == "https://example.invalid/bnb"
+    assert parsed["SOL_RPC_URL"] == "https://example.invalid/sol"
+    assert parsed["EMPTY"] == ""
+    assert "not_a_pair" not in parsed
+    assert "#" not in "".join(parsed.keys())
+
+
+def test_apply_parsed_env_does_not_clobber(monkeypatch: pytest.MonkeyPatch) -> None:
+    env: dict[str, str] = {"ETH_RPC_URL": "already-set", "BNB_RPC_URL": ""}
+    applied = main.apply_parsed_env(
+        {"ETH_RPC_URL": "from-file", "BNB_RPC_URL": "from-file", "NEW_KEY": "yes"},
+        env,
+    )
+    assert env["ETH_RPC_URL"] == "already-set"
+    assert env["BNB_RPC_URL"] == "from-file"
+    assert env["NEW_KEY"] == "yes"
+    assert applied == 2
+
+
+def test_load_script_dir_env_uses_given_file(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KEEP_TEST_RPC", raising=False)
+    path = tmp_path / ".env"
+    path.write_text('KEEP_TEST_RPC="from-script-dir"\n', encoding="utf-8")
+    loaded, exists = main.load_script_dir_env(path)
+    assert exists is True
+    assert loaded == path
+    assert os.environ["KEEP_TEST_RPC"] == "from-script-dir"
+    monkeypatch.delenv("KEEP_TEST_RPC", raising=False)
+
+
+def test_missing_rpc_hint_has_path_not_secrets() -> None:
+    hint = main.missing_rpc_hint("【ETH 链】", "/www/wwwroot/okb/.env", True)
+    assert "已尝试 /www/wwwroot/okb/.env" in hint
+    assert "存在" in hint
+    assert "https://" not in hint.lower()
+    assert "0x" not in hint
+    assert "dkey" not in hint.lower()
+    missing = main.missing_rpc_hint("【BNB 链】", "/www/wwwroot/okb/.env", False)
+    assert "不存在" in missing
 
 
 def test_config_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

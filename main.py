@@ -18,7 +18,9 @@ import signal
 import sys
 import time
 from collections import deque
+from collections.abc import MutableMapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Final, Iterable, Protocol
 
 import aiohttp
@@ -34,12 +36,6 @@ from web3 import AsyncWeb3
 from web3.providers.persistent import WebSocketProvider
 from web3.providers.rpc import AsyncHTTPProvider
 from web3.types import HexBytes, RPCEndpoint, TxParams
-
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover - optional at runtime
-    def load_dotenv() -> bool:  # type: ignore[misc]
-        return False
 
 try:
     from solana.rpc.async_api import AsyncClient as SolanaAsyncClient
@@ -269,6 +265,76 @@ def parse_compound_borrow_borrower(data: bytes | HexBytes | str) -> str:
 
 def env_str(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def script_dir_env_path() -> Path:
+    """`.env` next to this file — not the process cwd (BaoTa often differs)."""
+    return Path(__file__).resolve().parent / ".env"
+
+
+def parse_dotenv_text(text: str) -> dict[str, str]:
+    """Minimal KEY=VALUE parser. Comments/blanks skipped; optional quotes stripped."""
+    parsed: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        parsed[key] = value
+    return parsed
+
+
+def apply_parsed_env(
+    values: dict[str, str],
+    environ: MutableMapping[str, str] | None = None,
+) -> int:
+    """Apply parsed pairs. Do not overwrite already-set non-empty environment values."""
+    env = os.environ if environ is None else environ
+    applied = 0
+    for key, value in values.items():
+        if str(env.get(key, "")).strip():
+            continue
+        env[key] = value
+        applied += 1
+    return applied
+
+
+def load_script_dir_env(
+    path: Path | None = None,
+    environ: MutableMapping[str, str] | None = None,
+) -> tuple[Path, bool]:
+    """Always load script-dir `.env`. Built-in parser; python-dotenv is optional extra."""
+    env_path = path if path is not None else script_dir_env_path()
+    exists = env_path.is_file()
+    if exists:
+        try:
+            text = env_path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        else:
+            apply_parsed_env(parse_dotenv_text(text), environ)
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+
+        _load_dotenv(dotenv_path=str(env_path), override=False)
+    except Exception:
+        pass
+    return env_path, env_path.is_file()
+
+
+def missing_rpc_hint(alias: str, env_path: Path | str, exists: bool) -> str:
+    status = "存在" if exists else "不存在"
+    return f"{alias} 未配置 dRPC HTTP，已尝试 {env_path}（{status}）"
 
 
 def env_int(name: str, default: int | None = None) -> int | None:
@@ -550,6 +616,8 @@ class AppConfig:
     extra_aave_bnb: list[str] = field(default_factory=list)
     extra_compound_eth: list[str] = field(default_factory=list)
     extra_compound_bnb: list[str] = field(default_factory=list)
+    env_file_path: str = ""
+    env_file_exists: bool = False
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -774,16 +842,27 @@ class SolanaPublicLiquidator(Protocol):
 class SolanaLiquidationStub:
     """Connectivity-only stub. Does not encode a Solend/Kamino IDL."""
 
-    def __init__(self, rpc_url: str, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        rpc_url: str,
+        logger: logging.Logger,
+        env_file_path: str = "",
+        env_file_exists: bool = False,
+    ) -> None:
         self._rpc_url = rpc_url
         self._logger = logger
         self._client: Any = None
         self._rpc_issue_seen: dict[tuple[str, str], float] = {}
         self.alias = chain_alias("solana")
+        self._env_file_path = env_file_path
+        self._env_file_exists = env_file_exists
 
     async def connect(self) -> int:
         if not self._rpc_url:
-            self._logger.info("[solana] 未配置 dRPC HTTP，跳过")
+            self._logger.info(
+                "%s",
+                missing_rpc_hint(self.alias, self._env_file_path, self._env_file_exists),
+            )
             return 0
         if SolanaAsyncClient is None:
             self._logger.warning("solana stub: solana-py not installed")
@@ -1688,7 +1767,14 @@ class Keeper:
             for name, url, ws in mapping:
                 bound_name = name
                 if not url:
-                    logger.info("%s 未配置 dRPC HTTP，跳过", chain_alias(bound_name))
+                    logger.info(
+                        "%s",
+                        missing_rpc_hint(
+                            chain_alias(bound_name),
+                            config.env_file_path,
+                            config.env_file_exists,
+                        ),
+                    )
                     continue
                 chain = EvmChain(bound_name, url, ws, session, logger)
                 bound_alias = chain.alias
@@ -1715,7 +1801,12 @@ class Keeper:
                 await scanner.refresh_markets()
                 chains.append((chain, scanner))
 
-            sol = SolanaLiquidationStub(config.sol_rpc_url, logger)
+            sol = SolanaLiquidationStub(
+                config.sol_rpc_url,
+                logger,
+                config.env_file_path,
+                config.env_file_exists,
+            )
             try:
                 await sol.connect()
                 await sol.fetch_liquidatable(config.min_usd)
@@ -1774,9 +1865,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:
-    load_dotenv()
+    env_path, env_exists = load_script_dir_env()
     args = parse_args(argv)
     config = AppConfig.from_env()
+    config.env_file_path = str(env_path)
+    config.env_file_exists = env_exists
     if args.dry_run:
         config.dry_run = True
     logger = setup_logging(config)
