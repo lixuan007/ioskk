@@ -124,13 +124,29 @@ def test_transient_vs_revert_classifier() -> None:
     assert main.is_transient_rpc_error(ValueError("unexpected keyword")) is False
 
 
-def test_flushing_stream_handler_flushes() -> None:
+def test_keep_protocol_tx_drops_creations_and_ordinary_transfers() -> None:
+    pool = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
+    watched = {pool.lower()}
+    assert main.keep_protocol_tx(None, watched) is False
+    assert main.keep_protocol_tx("0x", watched) is False
+    assert main.keep_protocol_tx("", watched) is False
+    assert main.normalize_tx_to(None) is None
+    eoa = "0x1111111111111111111111111111111111111111"
+    assert main.keep_protocol_tx(eoa, watched) is False
+    assert main.keep_protocol_tx(pool, watched) is True
+    assert main.keep_protocol_tx(pool.lower(), watched) is True
+
+
+def test_realtime_and_flushing_handlers_flush() -> None:
     buf = io.StringIO()
-    handler = main.FlushingStreamHandler(buf)
+    handler = main.RealtimeStreamHandler(buf)
     handler.setFormatter(logging.Formatter("%(message)s"))
     record = logging.LogRecord("keeper", logging.INFO, __file__, 1, "hello-flush", None, None)
     handler.emit(record)
     assert "hello-flush" in buf.getvalue()
+    assert issubclass(main.FlushingStreamHandler, logging.StreamHandler)
+    assert main.FlushingStreamHandler is main.RealtimeStreamHandler
+    assert main.FlushingFileHandler is main.RealtimeFileHandler
 
 
 @pytest.mark.asyncio
@@ -149,9 +165,11 @@ def test_config_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DRY_RUN", raising=False)
     monkeypatch.delenv("MIN_USD", raising=False)
     monkeypatch.delenv("START_BLOCK", raising=False)
+    monkeypatch.delenv("CONCURRENCY", raising=False)
     cfg = main.AppConfig.from_env()
     assert cfg.dry_run is True
     assert cfg.min_usd == 2.0
+    assert cfg.concurrency == 1
     assert cfg.start_block is None
     assert any(p.name == "aave_v3" for p in cfg.protocols_for("ethereum"))
     assert any(p.name == "venus" for p in cfg.protocols_for("bsc"))

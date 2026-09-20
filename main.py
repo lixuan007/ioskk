@@ -153,6 +153,43 @@ def exceeds_min_usd(value_usd: float, min_usd: float) -> bool:
     return value_usd >= min_usd
 
 
+def normalize_tx_to(tx_to: Any) -> str | None:
+    """Return checksum `to`, or None for contract-creation / empty destination."""
+    if tx_to is None:
+        return None
+    text = str(tx_to).strip()
+    if text in {"", "0x", "0X", "None", "none"}:
+        return None
+    try:
+        return to_checksum_address(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def keep_protocol_tx(tx_to: Any, watched: set[str]) -> bool:
+    """Keep txs whose `to` is a watched official pool/cToken.
+
+    Drops EOA-to-EOA, unknown contracts, and empty-`to` creations. Creations are
+    never liquidation targets.
+    """
+    addr = normalize_tx_to(tx_to)
+    if addr is None:
+        return False
+    watched_l = {item.lower() for item in watched}
+    return addr.lower() in watched_l
+
+
+async def await_block_number(w3: AsyncWeb3) -> int:
+    """web3.py 7: `block_number` is awaitable; prefer get_block_number when present."""
+    getter = getattr(w3.eth, "get_block_number", None)
+    if callable(getter):
+        value = getter()
+        if asyncio.iscoroutine(value):
+            return int(await value)
+        return int(value)
+    return int(await w3.eth.block_number)
+
+
 def fingerprint(*parts: object) -> str:
     raw = "|".join(str(p).lower() for p in parts)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
@@ -330,7 +367,7 @@ class AppConfig:
     end_block: int | None = None
     min_usd: float = 2.0
     eth_usd: float = 3000.0
-    concurrency: int = 4
+    concurrency: int = 1
     log_chunk_blocks: int = 2000
     poll_interval_sec: float = 4.0
     live_lookback_blocks: int = 3
@@ -362,7 +399,7 @@ class AppConfig:
             end_block=env_int("END_BLOCK"),
             min_usd=env_float("MIN_USD", 2.0),
             eth_usd=env_float("ETH_USD", 3000.0),
-            concurrency=max(1, env_int("CONCURRENCY", 4) or 4),
+            concurrency=max(1, env_int("CONCURRENCY", 1) or 1),
             log_chunk_blocks=max(1, env_int("LOG_CHUNK_BLOCKS", 2000) or 2000),
             poll_interval_sec=env_float("POLL_INTERVAL_SEC", 4.0),
             live_lookback_blocks=max(0, env_int("LIVE_LOOKBACK_BLOCKS", 3) or 0),
@@ -400,19 +437,28 @@ class AppConfig:
 
 
 # ---------------------------------------------------------------------------
-# Module C — flushing logger + Telegram
+# Module C — realtime logger + Telegram (same process, shared session)
 # ---------------------------------------------------------------------------
 
-class FlushingStreamHandler(logging.StreamHandler):
+class RealtimeStreamHandler(logging.StreamHandler):
+    """Flush after every record so BaoTa / process-manager stdout updates immediately."""
+
     def emit(self, record: logging.LogRecord) -> None:
         super().emit(record)
         self.flush()
 
 
-class FlushingFileHandler(logging.FileHandler):
+class RealtimeFileHandler(logging.FileHandler):
+    """Flush after every record so tail -f / 宝塔日志 does not buffer."""
+
     def emit(self, record: logging.LogRecord) -> None:
         super().emit(record)
         self.flush()
+
+
+# Back-compat aliases for earlier helper names.
+FlushingStreamHandler = RealtimeStreamHandler
+FlushingFileHandler = RealtimeFileHandler
 
 
 def setup_logging(config: AppConfig) -> logging.Logger:
@@ -421,11 +467,11 @@ def setup_logging(config: AppConfig) -> logging.Logger:
     logger.handlers.clear()
     logger.propagate = False
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    stream = FlushingStreamHandler(sys.stdout)
+    stream = RealtimeStreamHandler(sys.stdout)
     stream.setFormatter(fmt)
     logger.addHandler(stream)
     if config.log_file:
-        file_handler = FlushingFileHandler(config.log_file, encoding="utf-8")
+        file_handler = RealtimeFileHandler(config.log_file, encoding="utf-8")
         file_handler.setFormatter(fmt)
         logger.addHandler(file_handler)
     return logger
@@ -462,7 +508,7 @@ class TelegramAlerter:
         chat_id: str,
         logger: logging.Logger,
     ) -> None:
-        self._session = session
+        self.session = session
         self._token = token
         self._chat_id = chat_id
         self._logger = logger
@@ -493,7 +539,7 @@ class TelegramAlerter:
         }
         try:
             timeout = aiohttp.ClientTimeout(total=2)
-            async with self._session.post(url, json=payload, timeout=timeout) as resp:
+            async with self.session.post(url, json=payload, timeout=timeout) as resp:
                 if resp.status >= 400:
                     self._logger.warning("telegram http %s", resp.status)
         except Exception as exc:
@@ -557,7 +603,7 @@ class SolanaLiquidationStub:
 
     async def connect(self) -> int:
         if not self._rpc_url:
-            self._logger.info("solana stub: SOL_RPC_URL empty, skipped")
+            self._logger.info("[solana] 未配置 dRPC HTTP，跳过")
             return 0
         if SolanaAsyncClient is None:
             self._logger.warning("solana stub: solana-py not installed")
@@ -566,11 +612,11 @@ class SolanaLiquidationStub:
         try:
             slot_resp = await self._client.get_slot()
             slot = int(getattr(slot_resp, "value", 0) or 0)
-            self._logger.info("solana stub connected slot=%s (liquidate not wired)", slot)
+            self._logger.info("[solana] 区块高度 %s (slot) 已连接 AsyncClient；公开清算 IDL 未接线", slot)
             return slot
         except Exception as exc:
             if is_transient_rpc_error(exc):
-                self._logger.warning("solana stub transient connect error: %s", exc)
+                self._logger.warning("[solana] 瞬时连接错误: %s", type(exc).__name__)
                 return 0
             raise
 
@@ -581,17 +627,42 @@ class SolanaLiquidationStub:
 
     async def fetch_liquidatable(self, min_usd: float) -> list[SolanaPosition]:
         self._logger.info(
-            "solana stub: fetch_liquidatable(min_usd=%s) returns [] until IDL is configured",
+            "[solana] 清算状态 状态=未接线IDL min_usd=%s 返回空",
             min_usd,
         )
         return []
 
     async def simulate_liquidate(self, position: SolanaPosition) -> bool:
-        self._logger.info("solana stub: simulate skipped for %s", position.obligation)
+        self._logger.info("[solana] 清算状态 obligation=%s 状态=模拟跳过", position.obligation)
         return False
 
     async def submit_liquidate(self, position: SolanaPosition) -> str:
         raise RuntimeError("solana public liquidate is stubbed; refusing to submit")
+
+    async def run_live(self, stop: asyncio.Event, poll_interval: float) -> None:
+        """Sequential slot monitor. Does not invent Solend/Kamino instruction accounts."""
+        if self._client is None:
+            return
+        last = 0
+        while not stop.is_set():
+            try:
+                slot_resp = await self._client.get_slot()
+                slot = int(getattr(slot_resp, "value", 0) or 0)
+                if slot and slot != last:
+                    self._logger.info(
+                        "[solana] 区块高度 %s 顺序监视 公开清算未接线IDL",
+                        slot,
+                    )
+                    last = slot
+            except Exception as exc:
+                if is_transient_rpc_error(exc):
+                    self._logger.warning("[solana] 瞬时 RPC 错误: %s", type(exc).__name__)
+                else:
+                    raise
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=poll_interval)
+            except TimeoutError:
+                continue
 
 
 # ---------------------------------------------------------------------------
@@ -722,18 +793,18 @@ class SimulationEngine:
         except Exception as exc:
             if is_execution_revert(exc):
                 self._logger.info(
-                    "sim revert %s %s user=%s",
+                    "[%s] 清算状态 协议=%s 用户=%s 状态=模拟回退已丢弃",
                     position.chain,
                     position.protocol,
                     position.user,
                 )
                 return False
             if is_transient_rpc_error(exc):
-                self._logger.warning("sim transient: %s", type(exc).__name__)
+                self._logger.warning("[%s] 清算状态 模拟瞬时错误: %s", position.chain, type(exc).__name__)
                 return False
             raise
         self._logger.info(
-            "sim ok %s %s user=%s target=%s",
+            "[%s] 清算状态 协议=%s 用户=%s 状态=模拟成功 目标=%s",
             position.chain,
             position.protocol,
             position.user,
@@ -742,7 +813,7 @@ class SimulationEngine:
         self._telegram.notify(
             ("sim", position.chain, position.protocol, position.user, position.target),
             (
-                f"<b>Simulation ok</b>\n"
+                f"<b>模拟成功</b>\n"
                 f"chain: {html.escape(position.chain)}\n"
                 f"protocol: {html.escape(position.protocol)}\n"
                 f"user: <code>{html.escape(position.user)}</code>\n"
@@ -779,11 +850,11 @@ class SimulationEngine:
         raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
         tx_hash = await w3.eth.send_raw_transaction(raw)
         hex_hash = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
-        self._logger.info("sent liquidation %s", hex_hash)
+        self._logger.info("[%s] 清算状态 协议=%s 用户=%s 状态=已发送 tx=%s", position.chain, position.protocol, position.user, hex_hash)
         self._telegram.notify(
             ("sent", hex_hash),
             (
-                f"<b>Liquidation sent</b>\n"
+                f"<b>已发送清算</b>\n"
                 f"chain: {html.escape(position.chain)}\n"
                 f"tx: <code>{html.escape(hex_hash)}</code>"
             ),
@@ -826,12 +897,15 @@ class MarketScanner:
         self.engine = engine
         self._logger = logger
         self._telegram = telegram
-        self._sem = asyncio.Semaphore(config.concurrency)
         self._markets: dict[str, list[str]] = {}
         self._reserves: dict[str, list[str]] = {}
+        self._watched: set[str] = set()
+        self._to_proto: dict[str, ProtocolMarket] = {}
         self._eval_seen = DedupCache(200)
 
     async def refresh_markets(self) -> None:
+        self._watched.clear()
+        self._to_proto.clear()
         for proto in self.protocols:
             try:
                 if proto.style == "compound":
@@ -843,16 +917,20 @@ class MarketScanner:
             except Exception:
                 self._logger.exception("market refresh bug %s", proto.name)
                 raise
+            for addr in self._watch_addresses(proto):
+                key = addr.lower()
+                self._watched.add(key)
+                self._to_proto[key] = proto
+        self._logger.info(
+            "[%s] 监视合约 %s 个（官方池/cToken，不含创建合约扫描）",
+            self.chain.name,
+            len(self._watched),
+        )
 
     def _watch_addresses(self, proto: ProtocolMarket) -> list[str]:
         if proto.style == "compound":
             return [proto.address, *self._markets.get(proto.address, [])]
         return [proto.address]
-
-    def _topics(self, proto: ProtocolMarket) -> list[bytes]:
-        if proto.style == "aave":
-            return [AAVE_LIQUIDATION_TOPIC, AAVE_BORROW_TOPIC_V3, AAVE_BORROW_TOPIC_V2]
-        return [COMPOUND_BORROW_TOPIC, COMPOUND_LIQUIDATE_TOPIC]
 
     async def _eth_call(self, to: str, data: bytes, label: str) -> bytes:
         tx: TxParams = {
@@ -886,68 +964,74 @@ class MarketScanner:
         return [to_checksum_address(a) for a in decoded]
 
     async def scan_range(self, start: int, end: int) -> None:
+        """Scan Aave-spec lending state in block order. No unbounded fan-out."""
         if end < start:
             return
-        chunk = self.config.log_chunk_blocks
-        windows = [(s, min(s + chunk - 1, end)) for s in range(start, end + 1, chunk)]
-        self._logger.info("%s scan blocks %s..%s (%s windows)", self.chain.name, start, end, len(windows))
+        self._logger.info("[%s] 区块高度 %s..%s 顺序扫描", self.chain.name, start, end)
+        for height in range(start, end + 1):
+            await self.scan_block(height)
 
-        async def _window(lo: int, hi: int) -> None:
-            async with self._sem:
-                await self._scan_window(lo, hi)
+    async def scan_block(self, height: int) -> None:
+        async def _fetch() -> Any:
+            return await self.chain.w3.eth.get_block(height, full_transactions=True)
 
-        async with asyncio.TaskGroup() as group:
-            for lo, hi in windows:
-                group.create_task(_window(lo, hi))
-
-    async def _scan_window(self, start: int, end: int) -> None:
-        users: dict[tuple[str, str], set[str]] = {}
-        for proto in self.protocols:
-            addresses = self._watch_addresses(proto)
-            if not addresses:
-                continue
-            logs = await self._get_logs(start, end, addresses, self._topics(proto))
-            for log in logs:
-                user = self._user_from_log(proto, log)
-                if user:
-                    users.setdefault((proto.name, proto.address), set()).add(user)
-        if not users:
+        try:
+            block = await self.chain.rpc(_fetch, label="get_block")
+        except TransientRpcError:
+            self._logger.warning("[%s] 区块高度 %s 读取失败已跳过", self.chain.name, height)
             return
-        self._logger.info("%s window %s..%s users=%s", self.chain.name, start, end, sum(len(v) for v in users.values()))
-        for (name, address), addrs in users.items():
+        txs = list(block["transactions"] if isinstance(block, dict) else block.transactions)
+        kept = 0
+        dropped = 0
+        found: dict[tuple[str, str], set[str]] = {}
+        for tx in txs:
+            tx_to = tx["to"] if isinstance(tx, dict) else getattr(tx, "to", None)
+            if not keep_protocol_tx(tx_to, self._watched):
+                dropped += 1
+                continue
+            kept += 1
+            proto = self._to_proto.get(str(normalize_tx_to(tx_to) or "").lower())
+            if proto is None:
+                continue
+            users = await self._users_from_kept_tx(proto, tx)
+            found.setdefault((proto.name, proto.address), set()).update(users)
+        self._logger.info(
+            "[%s] 区块高度 %s 保留协议交易=%s 丢弃普通转账=%s",
+            self.chain.name,
+            height,
+            kept,
+            dropped,
+        )
+        for (name, address), users in found.items():
             proto = next(p for p in self.protocols if p.address == address and p.name == name)
-            async with asyncio.TaskGroup() as group:
-                for user in addrs:
-                    group.create_task(self._evaluate_user(proto, user))
+            for user in users:
+                await self._evaluate_user(proto, user)
 
-    async def _get_logs(
-        self,
-        start: int,
-        end: int,
-        addresses: list[str],
-        topics: list[bytes],
-    ) -> list[Any]:
-        topic0 = ["0x" + t.hex() for t in topics]
-        collected: list[Any] = []
-        # Chunk address lists — some RPCs reject large filters.
-        step = 20
-        for i in range(0, len(addresses), step):
-            batch = addresses[i : i + step]
-            params = {
-                "fromBlock": start,
-                "toBlock": end,
-                "address": batch if len(batch) > 1 else batch[0],
-                "topics": [topic0],
-            }
-
-            async def _do(p: dict[str, Any] = params) -> list[Any]:
-                return await self.chain.w3.eth.get_logs(p)
-
+    async def _users_from_kept_tx(self, proto: ProtocolMarket, tx: Any) -> set[str]:
+        users: set[str] = set()
+        tx_from = tx["from"] if isinstance(tx, dict) else getattr(tx, "from", None)
+        if tx_from:
             try:
-                collected.extend(await self.chain.rpc(_do, label="get_logs"))
-            except TransientRpcError:
-                self._logger.warning("%s get_logs %s..%s skipped after retries", self.chain.name, start, end)
-        return collected
+                users.add(to_checksum_address(str(tx_from)))
+            except (ValueError, TypeError):
+                pass
+        tx_hash = tx["hash"] if isinstance(tx, dict) else getattr(tx, "hash", None)
+        if tx_hash is None:
+            return users
+
+        async def _receipt() -> Any:
+            return await self.chain.w3.eth.get_transaction_receipt(tx_hash)
+
+        try:
+            receipt = await self.chain.rpc(_receipt, label="get_receipt")
+        except TransientRpcError:
+            return users
+        logs = receipt["logs"] if isinstance(receipt, dict) else receipt.logs
+        for log in logs:
+            user = self._user_from_log(proto, log)
+            if user:
+                users.add(user)
+        return users
 
     def _user_from_log(self, proto: ProtocolMarket, log: Any) -> str | None:
         topics = list(log["topics"] if isinstance(log, dict) else log.topics)
@@ -1007,12 +1091,25 @@ class MarketScanner:
         ) = decode(["uint256", "uint256", "uint256", "uint256", "uint256", "uint256"], raw)
         collateral_usd = self._collateral_usd(proto, int(total_collateral_base))
         if not exceeds_min_usd(collateral_usd, self.config.min_usd):
+            self._logger.info(
+                "[%s] 清算状态 协议=%s 用户=%s 状态=低于美元门槛 已丢弃 usd=%.2f",
+                proto.chain,
+                proto.name,
+                user,
+                collateral_usd,
+            )
             return
         if int(total_debt_base) == 0 or int(health_factor) >= WAD:
+            self._logger.info(
+                "[%s] 清算状态 协议=%s 用户=%s 状态=安全",
+                proto.chain,
+                proto.name,
+                user,
+            )
             return
         hf = int(health_factor) / WAD
         self._logger.info(
-            "liquidatable %s %s user=%s hf=%.6f usd=%.2f",
+            "[%s] 清算状态 协议=%s 用户=%s 状态=可清算 hf=%.6f usd=%.2f",
             proto.chain,
             proto.name,
             user,
@@ -1022,7 +1119,7 @@ class MarketScanner:
         self._telegram.notify(
             ("liq", proto.chain, proto.name, user),
             (
-                f"<b>Liquidatable position</b>\n"
+                f"<b>可清算仓位</b>\n"
                 f"chain: {html.escape(proto.chain)}\n"
                 f"protocol: {html.escape(proto.name)}\n"
                 f"user: <code>{html.escape(user)}</code>\n"
@@ -1065,6 +1162,12 @@ class MarketScanner:
         )
         error, _liquidity, shortfall = decode(["uint256", "uint256", "uint256"], raw)
         if int(error) != 0 or int(shortfall) == 0:
+            self._logger.info(
+                "[%s] 清算状态 协议=%s 用户=%s 状态=安全",
+                proto.chain,
+                proto.name,
+                user,
+            )
             return
         markets = self._markets.get(proto.address) or await self._get_all_markets(proto.address)
         self._markets[proto.address] = markets
@@ -1112,12 +1215,19 @@ class MarketScanner:
         if collateral_usd <= 0:
             collateral_usd = int(shortfall) / WAD
         if not exceeds_min_usd(collateral_usd, self.config.min_usd):
+            self._logger.info(
+                "[%s] 清算状态 协议=%s 用户=%s 状态=低于美元门槛 已丢弃 usd=%.2f",
+                proto.chain,
+                proto.name,
+                user,
+                collateral_usd,
+            )
             return
         if not collaterals or not debts:
             return
         hf = 0.0
         self._logger.info(
-            "liquidatable %s %s user=%s shortfall=%s usd=%.2f",
+            "[%s] 清算状态 协议=%s 用户=%s 状态=可清算 shortfall=%s usd=%.2f",
             proto.chain,
             proto.name,
             user,
@@ -1127,7 +1237,7 @@ class MarketScanner:
         self._telegram.notify(
             ("liq", proto.chain, proto.name, user),
             (
-                f"<b>Liquidatable position</b>\n"
+                f"<b>可清算仓位</b>\n"
                 f"chain: {html.escape(proto.chain)}\n"
                 f"protocol: {html.escape(proto.name)}\n"
                 f"user: <code>{html.escape(user)}</code>\n"
@@ -1173,7 +1283,7 @@ class MarketScanner:
         start = self.config.start_block
         if start is None:
             return
-        head = int(await self.chain.rpc(lambda: self.chain.w3.eth.block_number, label="block_number"))
+        head = int(await self.chain.rpc(lambda: await_block_number(self.chain.w3), label="block_number"))
         end = self.config.end_block if self.config.end_block is not None else head
         end = min(end, head)
         await self.scan_range(start, end)
@@ -1181,13 +1291,16 @@ class MarketScanner:
     async def _handle_new_head(self, last: int, head: int) -> int:
         if head <= last:
             return last
-        from_block = max(0, last + 1 - self.config.live_lookback_blocks)
+        from_block = last + 1
+        lookback = self.config.live_lookback_blocks
+        if lookback:
+            from_block = max(0, last + 1 - lookback)
         await self.scan_range(from_block, head)
         return head
 
     async def _run_live_ws(self, stop: asyncio.Event, last: int) -> int:
-        """newHeads subscription. HTTP get_logs still does the work; WS only signals heads."""
-        self._logger.info("%s subscribing newHeads on websocket", self.chain.name)
+        """newHeads subscription signals height; blocks are still read in order over HTTP."""
+        self._logger.info("[%s] 订阅 newHeads  websocket", self.chain.name)
         async with AsyncWeb3(WebSocketProvider(self.chain.ws_url)) as ws_w3:
             await ws_w3.eth.subscribe("newHeads")
             waiter = asyncio.create_task(stop.wait())
@@ -1201,7 +1314,7 @@ class MarketScanner:
                         number = result.get("number")
                     if number is None:
                         number = await self.chain.rpc(
-                            lambda: self.chain.w3.eth.block_number, label="block_number"
+                            lambda: await_block_number(self.chain.w3), label="block_number"
                         )
                     last = await self._handle_new_head(last, int(number))
                     if waiter.done():
@@ -1216,9 +1329,9 @@ class MarketScanner:
         return last
 
     async def run_live(self, stop: asyncio.Event) -> None:
-        head = int(await self.chain.rpc(lambda: self.chain.w3.eth.block_number, label="block_number"))
+        head = int(await self.chain.rpc(lambda: await_block_number(self.chain.w3), label="block_number"))
         last = head
-        self._logger.info("%s live from block %s", self.chain.name, last)
+        self._logger.info("[%s] 区块高度 %s 进入实时顺序监视", self.chain.name, last)
         while not stop.is_set():
             try:
                 if self.chain.ws_url:
@@ -1235,16 +1348,16 @@ class MarketScanner:
                         }:
                             raise
                         self._logger.warning(
-                            "%s newHeads websocket failed (%s), polling instead",
+                            "[%s] newHeads 失败 (%s)，改用 HTTP 轮询",
                             self.chain.name,
                             type(exc).__name__,
                         )
-                head = int(await self.chain.rpc(lambda: self.chain.w3.eth.block_number, label="block_number"))
+                head = int(await self.chain.rpc(lambda: await_block_number(self.chain.w3), label="block_number"))
                 last = await self._handle_new_head(last, head)
             except TransientRpcError:
-                self._logger.warning("%s live loop transient, retrying", self.chain.name)
+                self._logger.warning("[%s] 实时循环瞬时错误，重试", self.chain.name)
             except Exception:
-                self._logger.exception("%s live loop bug", self.chain.name)
+                self._logger.exception("[%s] 实时循环逻辑错误", self.chain.name)
                 raise
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.config.poll_interval_sec)
@@ -1266,87 +1379,106 @@ def operator_account(config: AppConfig) -> LocalAccount | None:
     return account
 
 
-async def run_keeper(config: AppConfig, logger: logging.Logger) -> None:
-    if not config.dry_run and not config.evm_private_key:
-        raise SystemExit("DRY_RUN=false requires EVM_PRIVATE_KEY (operator key only)")
-    account = operator_account(config)
-    operator = config.evm_address or (account.address if account else "")
-    if account and not config.evm_address:
-        operator = account.address
+class Keeper:
+    """Single-process keeper: shared aiohttp session, sequential EVM/Solana monitors."""
 
-    timeout = aiohttp.ClientTimeout(total=30, connect=10)
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError:
-            pass
+    def __init__(self, config: AppConfig, logger: logging.Logger) -> None:
+        self.config = config
+        self.logger = logger
+        self.session: aiohttp.ClientSession | None = None
+        self.telegram: TelegramAlerter | None = None
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        telegram = TelegramAlerter(session, config.telegram_bot_token, config.telegram_chat_id, logger)
-        chains: list[tuple[EvmChain, MarketScanner]] = []
-        mapping = (
-            ("ethereum", config.eth_rpc_url, config.eth_ws_url),
-            ("bsc", config.bnb_rpc_url, config.bnb_ws_url),
-        )
-        for name, url, ws in mapping:
-            if not url:
-                logger.info("chain %s disabled (no RPC URL)", name)
-                continue
-            chain = EvmChain(name, url, ws, session, logger)
-            await chain.attach_session()
+    async def run(self) -> None:
+        config = self.config
+        logger = self.logger
+        if not config.dry_run and not config.evm_private_key:
+            raise SystemExit("DRY_RUN=false requires EVM_PRIVATE_KEY (operator key only)")
+        account = operator_account(config)
+        operator = config.evm_address or (account.address if account else "")
+        if account and not config.evm_address:
+            operator = account.address
+
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                chain.chain_id = int(await chain.rpc(lambda: chain.w3.eth.chain_id, label="chain_id"))
-                head = int(await chain.rpc(lambda: chain.w3.eth.block_number, label="block_number"))
-                logger.info("%s connected chain_id=%s head=%s", name, chain.chain_id, head)
-            except TransientRpcError:
-                logger.warning("%s initial connect failed, will retry in loop", name)
-            engine = SimulationEngine(chain, operator, account, config.dry_run, logger, telegram)
-            scanner = MarketScanner(chain, config, config.protocols_for(name), engine, logger, telegram)
-            await scanner.refresh_markets()
-            chains.append((chain, scanner))
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:
+                pass
 
-        sol = SolanaLiquidationStub(config.sol_rpc_url, logger)
-        try:
-            await sol.connect()
-            await sol.fetch_liquidatable(config.min_usd)
-        except Exception as exc:
-            if is_transient_rpc_error(exc):
-                logger.warning("solana stub transient: %s", type(exc).__name__)
-            else:
-                raise
-
-        if not chains and not config.sol_rpc_url:
-            raise SystemExit("no RPC URLs configured (set ETH_RPC_URL / BNB_RPC_URL / SOL_RPC_URL)")
-
-        logger.info(
-            "keeper start dry_run=%s operator=%s min_usd=%s concurrency=%s",
-            config.dry_run,
-            operator or "<unset>",
-            config.min_usd,
-            config.concurrency,
-        )
-        if not config.dry_run:
-            logger.warning("DRY_RUN is off — successful simulations will broadcast from the operator key")
-
-        try:
-            historical_jobs = [scanner.run_historical() for _chain, scanner in chains if config.start_block is not None]
-            if historical_jobs:
-                async with asyncio.TaskGroup() as group:
-                    for job in historical_jobs:
-                        group.create_task(job)
-            run_live = config.start_block is None or (
-                config.live_after_historical and config.end_block is None
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            self.session = session
+            self.telegram = TelegramAlerter(
+                session, config.telegram_bot_token, config.telegram_chat_id, logger
             )
-            if run_live and not stop.is_set():
-                async with asyncio.TaskGroup() as group:
+            telegram = self.telegram
+            chains: list[tuple[EvmChain, MarketScanner]] = []
+            mapping = (
+                ("ethereum", config.eth_rpc_url, config.eth_ws_url),
+                ("bsc", config.bnb_rpc_url, config.bnb_ws_url),
+            )
+            for name, url, ws in mapping:
+                if not url:
+                    logger.info("[%s] 未配置 dRPC HTTP，跳过", name)
+                    continue
+                chain = EvmChain(name, url, ws, session, logger)
+                await chain.attach_session()
+                try:
+                    chain.chain_id = int(await chain.rpc(lambda: chain.w3.eth.chain_id, label="chain_id"))
+                    head = int(await chain.rpc(lambda: await_block_number(chain.w3), label="block_number"))
+                    logger.info("[%s] 区块高度 %s 已连接 chain_id=%s", name, head, chain.chain_id)
+                except TransientRpcError:
+                    logger.warning("[%s] 初始连接失败，循环内重试", name)
+                engine = SimulationEngine(chain, operator, account, config.dry_run, logger, telegram)
+                scanner = MarketScanner(chain, config, config.protocols_for(name), engine, logger, telegram)
+                await scanner.refresh_markets()
+                chains.append((chain, scanner))
+
+            sol = SolanaLiquidationStub(config.sol_rpc_url, logger)
+            try:
+                await sol.connect()
+                await sol.fetch_liquidatable(config.min_usd)
+            except Exception as exc:
+                if is_transient_rpc_error(exc):
+                    logger.warning("[solana] 瞬时错误: %s", type(exc).__name__)
+                else:
+                    raise
+
+            if not chains and not config.sol_rpc_url:
+                raise SystemExit("no RPC URLs configured (set ETH_RPC_URL / BNB_RPC_URL / SOL_RPC_URL)")
+
+            logger.info(
+                "keeper start dry_run=%s operator=%s min_usd=%s sequential=true",
+                config.dry_run,
+                operator or "<unset>",
+                config.min_usd,
+            )
+            if not config.dry_run:
+                logger.warning("DRY_RUN 已关闭 — 模拟成功后将用操作者私钥广播")
+
+            try:
+                if config.start_block is not None:
                     for _chain, scanner in chains:
-                        group.create_task(scanner.run_live(stop))
-                    group.create_task(stop.wait())
-        finally:
-            await sol.close()
-            await telegram.drain()
+                        await scanner.run_historical()
+                run_live = config.start_block is None or (
+                    config.live_after_historical and config.end_block is None
+                )
+                if run_live and not stop.is_set():
+                    async with asyncio.TaskGroup() as group:
+                        for _chain, scanner in chains:
+                            group.create_task(scanner.run_live(stop))
+                        if config.sol_rpc_url:
+                            group.create_task(sol.run_live(stop, config.poll_interval_sec))
+                        group.create_task(stop.wait())
+            finally:
+                await sol.close()
+                await telegram.drain()
+                self.session = None
+
+
+async def run_keeper(config: AppConfig, logger: logging.Logger) -> None:
+    await Keeper(config, logger).run()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -33,7 +33,7 @@ cp .env.example .env
 python main.py
 ```
 
-With no `START_BLOCK`, the process follows new heads (WebSocket `newHeads` when `ETH_WS_URL` / `BNB_WS_URL` is set, otherwise HTTP poll), reads protocol logs for known pools only, prefilters by `MIN_USD`, and simulates official `liquidationCall` / `liquidateBorrow`.
+With no `START_BLOCK`, the process follows new heads (WebSocket `newHeads` when `ETH_WS_URL` / `BNB_WS_URL` is set, otherwise HTTP poll). Each height is read **in block order**. Ordinary transfers are dropped by inspecting `tx.to` (empty-`to` creations and EOA-to-EOA never become targets). Only txs to configured official pools/cTokens are kept, then `getUserAccountData` / official liquidate is `eth_call`ed from the operator.
 
 Historical backfill:
 
@@ -63,8 +63,8 @@ Helpers (`encode_*`, dedup, USD filter, user-config bits, revert vs transient RP
 
 | Module | Role |
 | --- | --- |
-| A Scanner | Live new-heads poll/subscribe + optional `start_block..end_block`. Sliding-window concurrent `eth_getLogs` on configured pool/cToken addresses and official Borrow/Liquidation topics. |
-| B Simulator | Encodes Aave-style `liquidationCall` and Compound-style `liquidateBorrow`. `eth_call` from the operator. Send only after success and `DRY_RUN=false`. |
-| C Logger / Telegram | Flushing stream + file handlers (immediate flush for process managers). Telegram HTML via `asyncio.create_task`, 2s timeout, MD5 deque(200) dedup. |
+| A Scanner | Sequential block-order `get_block(full_transactions=True)`. Pre-filter by `tx.to` against watched official pools/cTokens. Live new-heads poll/subscribe + optional `start_block..end_block`. |
+| B Simulator | Official `getUserAccountData` / `liquidationCall` / `liquidateBorrow` via `eth_call` from the operator. Revert = safe, discard. Send only after success and `DRY_RUN=false` with a matching operator key. |
+| C Logger / Telegram | `RealtimeStreamHandler` / `RealtimeFileHandler` flush every record (BaoTa). Chinese 区块高度 / 清算状态 lines. Telegram uses the process `self.session`, `create_task`, 2s timeout, MD5 deque(200). |
 
 Solana stays behind `SolanaPublicLiquidator`: the stub connects and reports slot height, then returns no positions until a specific program IDL is wired.
