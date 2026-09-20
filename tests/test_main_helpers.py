@@ -48,6 +48,40 @@ def test_encode_compound_liquidate_borrow_layout() -> None:
     assert len(data) == 4 + 32 * 3
 
 
+def test_chain_alias_is_per_object_not_global() -> None:
+    assert main.chain_alias("ethereum") == "【ETH 链】"
+    assert main.chain_alias("ETH") == "【ETH 链】"
+    assert main.chain_alias("bsc") == "【BNB 链】"
+    assert main.chain_alias("bnb") == "【BNB 链】"
+
+    class Bound:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.alias = main.chain_alias(name)
+
+    eth = Bound("ethereum")
+    bnb = Bound("bsc")
+    assert eth.alias == "【ETH 链】"
+    assert bnb.alias == "【BNB 链】"
+    assert main.chain_alias(eth) == "【ETH 链】"
+    assert main.chain_alias(bnb) == "【BNB 链】"
+    # Bound alias wins even if name is wrong (the concurrency bug).
+    confused = Bound("ethereum")
+    confused.alias = "【BNB 链】"
+    assert main.chain_alias(confused) == "【BNB 链】"
+
+
+def test_native_floor_strictly_greater_than_default() -> None:
+    wei_ok = int(main.AsyncWeb3.to_wei(0.06, "ether"))
+    wei_eq = int(main.AsyncWeb3.to_wei(0.05, "ether"))
+    wei_low = int(main.AsyncWeb3.to_wei(0.04, "ether"))
+    assert main.exceeds_native_floor(wei_ok, 0.05) is True
+    assert main.exceeds_native_floor(wei_eq, 0.05) is False
+    assert main.exceeds_native_floor(wei_low, 0.05) is False
+    assert main.native_ether_amount(wei_eq) == pytest.approx(0.05)
+    assert main.exceeds_native_floor(wei_low, 0.0) is True
+
+
 def test_exceeds_min_usd_floor() -> None:
     assert main.exceeds_min_usd(2.0, 2.0) is True
     assert main.exceeds_min_usd(1.99, 2.0) is False
@@ -166,9 +200,11 @@ def test_config_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIN_USD", raising=False)
     monkeypatch.delenv("START_BLOCK", raising=False)
     monkeypatch.delenv("CONCURRENCY", raising=False)
+    monkeypatch.delenv("MIN_NATIVE", raising=False)
     cfg = main.AppConfig.from_env()
     assert cfg.dry_run is True
     assert cfg.min_usd == 2.0
+    assert cfg.min_native == 0.05
     assert cfg.concurrency == 1
     assert cfg.start_block is None
     assert any(p.name == "aave_v3" for p in cfg.protocols_for("ethereum"))

@@ -153,6 +153,43 @@ def exceeds_min_usd(value_usd: float, min_usd: float) -> bool:
     return value_usd >= min_usd
 
 
+CHAIN_ALIASES: Final[dict[str, str]] = {
+    "ethereum": "【ETH 链】",
+    "eth": "【ETH 链】",
+    "bsc": "【BNB 链】",
+    "bnb": "【BNB 链】",
+    "binance": "【BNB 链】",
+    "solana": "【SOL 链】",
+    "sol": "【SOL 链】",
+}
+
+
+def chain_alias(chain: Any) -> str:
+    """User-facing chain label from the per-chain object, never a shared global.
+
+    Concurrent ETH/BNB scanners must each print their own bound alias.
+    """
+    bound = getattr(chain, "alias", None)
+    if isinstance(bound, str) and bound.startswith("【"):
+        return bound
+    raw = getattr(chain, "name", None)
+    key = str(raw if raw is not None else chain).strip().lower()
+    key = key.replace("【", "").replace("】", "").replace(" 链", "").replace("链", "")
+    return CHAIN_ALIASES.get(key, f"【{key} 链】")
+
+
+def native_ether_amount(wei: int) -> float:
+    """Convert wei with the same `from_wei(..., 'ether')` path as web3.py."""
+    return float(AsyncWeb3.from_wei(int(wei), "ether"))
+
+
+def exceeds_native_floor(wei: int, min_native: float) -> bool:
+    """True only when official pool/cToken native coin is strictly greater than the floor."""
+    if min_native <= 0:
+        return True
+    return native_ether_amount(wei) > min_native
+
+
 def normalize_tx_to(tx_to: Any) -> str | None:
     """Return checksum `to`, or None for contract-creation / empty destination."""
     if tx_to is None:
@@ -366,6 +403,7 @@ class AppConfig:
     start_block: int | None = None
     end_block: int | None = None
     min_usd: float = 2.0
+    min_native: float = 0.05
     eth_usd: float = 3000.0
     concurrency: int = 1
     log_chunk_blocks: int = 2000
@@ -398,6 +436,7 @@ class AppConfig:
             start_block=env_int("START_BLOCK"),
             end_block=env_int("END_BLOCK"),
             min_usd=env_float("MIN_USD", 2.0),
+            min_native=env_float("MIN_NATIVE", 0.05),
             eth_usd=env_float("ETH_USD", 3000.0),
             concurrency=max(1, env_int("CONCURRENCY", 1) or 1),
             log_chunk_blocks=max(1, env_int("LOG_CHUNK_BLOCKS", 2000) or 2000),
@@ -679,6 +718,7 @@ class EvmChain:
         logger: logging.Logger,
     ) -> None:
         self.name = name
+        self.alias = chain_alias(name)
         self.rpc_url = rpc_url
         self.ws_url = ws_url
         self._session = session
@@ -699,7 +739,7 @@ class EvmChain:
             await cache(self._session)
 
     async def reconnect(self) -> None:
-        self._logger.warning("%s rpc reconnect", self.name)
+        self._logger.warning("%s rpc reconnect", self.alias)
         disconnect = getattr(self.w3.provider, "disconnect", None)
         if disconnect is not None:
             try:
@@ -707,7 +747,7 @@ class EvmChain:
                 if asyncio.iscoroutine(result):
                     await result
             except Exception as exc:
-                self._logger.warning("%s provider disconnect: %s", self.name, exc)
+                self._logger.warning("%s provider disconnect: %s", self.alias, exc)
         self.w3 = self._make_w3()
         await self.attach_session()
         self.chain_id = None
@@ -726,7 +766,7 @@ class EvmChain:
                     raise
                 self._logger.warning(
                     "%s %s transient (%s/%s): %s",
-                    self.name,
+                    self.alias,
                     label,
                     attempt,
                     attempts,
@@ -754,11 +794,13 @@ class SimulationEngine:
         dry_run: bool,
         logger: logging.Logger,
         telegram: TelegramAlerter,
+        min_native: float = 0.05,
     ) -> None:
         self.chain = chain
         self.operator = operator
         self.account = account
         self.dry_run = dry_run
+        self.min_native = min_native
         self._logger = logger
         self._telegram = telegram
 
@@ -777,9 +819,34 @@ class SimulationEngine:
             position.user, position.repay_amount, position.collateral
         )
 
+    async def _target_native_ok(self, contract: str) -> bool:
+        """Last gate before eth_call: watched official contract native coin > MIN_NATIVE."""
+        addr = to_checksum_address(contract)
+        w3 = self.chain.w3
+
+        async def _bal() -> int:
+            return int(await w3.eth.get_balance(addr))
+
+        try:
+            wei = int(await self.chain.rpc(_bal, label="get_balance"))
+        except TransientRpcError:
+            return False
+        if exceeds_native_floor(wei, self.min_native):
+            return True
+        self._logger.info(
+            "%s 清算状态 合约=%s 状态=低于原生币门槛 已丢弃 native=%.6f 门槛=%s",
+            self.chain.alias,
+            addr,
+            native_ether_amount(wei),
+            self.min_native,
+        )
+        return False
+
     async def simulate(self, position: CandidatePosition) -> bool:
         if not self.operator:
             self._logger.warning("skip sim: EVM_ADDRESS empty")
+            return False
+        if not await self._target_native_ok(position.target):
             return False
         data = self._calldata(position)
         tx: TxParams = {
@@ -793,28 +860,28 @@ class SimulationEngine:
         except Exception as exc:
             if is_execution_revert(exc):
                 self._logger.info(
-                    "[%s] 清算状态 协议=%s 用户=%s 状态=模拟回退已丢弃",
-                    position.chain,
+                    "%s 清算状态 协议=%s 用户=%s 状态=模拟回退已丢弃",
+                    self.chain.alias,
                     position.protocol,
                     position.user,
                 )
                 return False
             if is_transient_rpc_error(exc):
-                self._logger.warning("[%s] 清算状态 模拟瞬时错误: %s", position.chain, type(exc).__name__)
+                self._logger.warning("%s 清算状态 模拟瞬时错误: %s", self.chain.alias, type(exc).__name__)
                 return False
             raise
         self._logger.info(
-            "[%s] 清算状态 协议=%s 用户=%s 状态=模拟成功 目标=%s",
-            position.chain,
+            "%s 清算状态 协议=%s 用户=%s 状态=模拟成功 目标=%s",
+            self.chain.alias,
             position.protocol,
             position.user,
             position.target,
         )
         self._telegram.notify(
-            ("sim", position.chain, position.protocol, position.user, position.target),
+            ("sim", self.chain.alias, position.protocol, position.user, position.target),
             (
                 f"<b>模拟成功</b>\n"
-                f"chain: {html.escape(position.chain)}\n"
+                f"chain: {html.escape(self.chain.alias)}\n"
                 f"protocol: {html.escape(position.protocol)}\n"
                 f"user: <code>{html.escape(position.user)}</code>\n"
                 f"hf: {position.health_factor:.6f}\n"
@@ -850,12 +917,12 @@ class SimulationEngine:
         raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
         tx_hash = await w3.eth.send_raw_transaction(raw)
         hex_hash = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
-        self._logger.info("[%s] 清算状态 协议=%s 用户=%s 状态=已发送 tx=%s", position.chain, position.protocol, position.user, hex_hash)
+        self._logger.info("%s 清算状态 协议=%s 用户=%s 状态=已发送 tx=%s", self.chain.alias, position.protocol, position.user, hex_hash)
         self._telegram.notify(
             ("sent", hex_hash),
             (
                 f"<b>已发送清算</b>\n"
-                f"chain: {html.escape(position.chain)}\n"
+                f"chain: {html.escape(self.chain.alias)}\n"
                 f"tx: <code>{html.escape(hex_hash)}</code>"
             ),
         )
@@ -902,6 +969,7 @@ class MarketScanner:
         self._watched: set[str] = set()
         self._to_proto: dict[str, ProtocolMarket] = {}
         self._eval_seen = DedupCache(200)
+        self._native_ok: dict[str, bool] = {}
 
     async def refresh_markets(self) -> None:
         self._watched.clear()
@@ -922,8 +990,8 @@ class MarketScanner:
                 self._watched.add(key)
                 self._to_proto[key] = proto
         self._logger.info(
-            "[%s] 监视合约 %s 个（官方池/cToken，不含创建合约扫描）",
-            self.chain.name,
+            "%s 监视合约 %s 个（官方池/cToken，不含创建合约扫描）",
+            self.chain.alias,
             len(self._watched),
         )
 
@@ -967,7 +1035,7 @@ class MarketScanner:
         """Scan Aave-spec lending state in block order. No unbounded fan-out."""
         if end < start:
             return
-        self._logger.info("[%s] 区块高度 %s..%s 顺序扫描", self.chain.name, start, end)
+        self._logger.info("%s 区块高度 %s..%s 顺序扫描", self.chain.alias, start, end)
         for height in range(start, end + 1):
             await self.scan_block(height)
 
@@ -978,26 +1046,33 @@ class MarketScanner:
         try:
             block = await self.chain.rpc(_fetch, label="get_block")
         except TransientRpcError:
-            self._logger.warning("[%s] 区块高度 %s 读取失败已跳过", self.chain.name, height)
+            self._logger.warning("%s 区块高度 %s 读取失败已跳过", self.chain.alias, height)
             return
         txs = list(block["transactions"] if isinstance(block, dict) else block.transactions)
         kept = 0
         dropped = 0
         found: dict[tuple[str, str], set[str]] = {}
+        self._native_ok.clear()
         for tx in txs:
             tx_to = tx["to"] if isinstance(tx, dict) else getattr(tx, "to", None)
             if not keep_protocol_tx(tx_to, self._watched):
                 dropped += 1
                 continue
+            target = normalize_tx_to(tx_to)
+            if target is None:
+                dropped += 1
+                continue
+            if not await self._official_native_ok(target):
+                continue
             kept += 1
-            proto = self._to_proto.get(str(normalize_tx_to(tx_to) or "").lower())
+            proto = self._to_proto.get(target.lower())
             if proto is None:
                 continue
             users = await self._users_from_kept_tx(proto, tx)
             found.setdefault((proto.name, proto.address), set()).update(users)
         self._logger.info(
-            "[%s] 区块高度 %s 保留协议交易=%s 丢弃普通转账=%s",
-            self.chain.name,
+            "%s 区块高度 %s 保留协议交易=%s 丢弃普通转账=%s",
+            self.chain.alias,
             height,
             kept,
             dropped,
@@ -1006,6 +1081,36 @@ class MarketScanner:
             proto = next(p for p in self.protocols if p.address == address and p.name == name)
             for user in users:
                 await self._evaluate_user(proto, user)
+
+    async def _official_native_ok(self, contract: str) -> bool:
+        """Pre-sim: only watched official pool/cToken native coin strictly above MIN_NATIVE."""
+        key = contract.lower()
+        cached = self._native_ok.get(key)
+        if cached is not None:
+            return cached
+        addr = to_checksum_address(contract)
+        w3 = self.chain.w3
+
+        async def _bal() -> int:
+            return int(await w3.eth.get_balance(addr))
+
+        try:
+            wei = int(await self.chain.rpc(_bal, label="get_balance"))
+        except TransientRpcError:
+            self._native_ok[key] = False
+            return False
+        amount = native_ether_amount(wei)
+        ok = exceeds_native_floor(wei, self.config.min_native)
+        self._native_ok[key] = ok
+        if not ok:
+            self._logger.info(
+                "%s 清算状态 合约=%s 状态=低于原生币门槛 已丢弃 native=%.6f 门槛=%s",
+                self.chain.alias,
+                addr,
+                amount,
+                self.config.min_native,
+            )
+        return ok
 
     async def _users_from_kept_tx(self, proto: ProtocolMarket, tx: Any) -> set[str]:
         users: set[str] = set()
@@ -1092,8 +1197,8 @@ class MarketScanner:
         collateral_usd = self._collateral_usd(proto, int(total_collateral_base))
         if not exceeds_min_usd(collateral_usd, self.config.min_usd):
             self._logger.info(
-                "[%s] 清算状态 协议=%s 用户=%s 状态=低于美元门槛 已丢弃 usd=%.2f",
-                proto.chain,
+                "%s 清算状态 协议=%s 用户=%s 状态=低于美元门槛 已丢弃 usd=%.2f",
+                self.chain.alias,
                 proto.name,
                 user,
                 collateral_usd,
@@ -1101,16 +1206,16 @@ class MarketScanner:
             return
         if int(total_debt_base) == 0 or int(health_factor) >= WAD:
             self._logger.info(
-                "[%s] 清算状态 协议=%s 用户=%s 状态=安全",
-                proto.chain,
+                "%s 清算状态 协议=%s 用户=%s 状态=安全",
+                self.chain.alias,
                 proto.name,
                 user,
             )
             return
         hf = int(health_factor) / WAD
         self._logger.info(
-            "[%s] 清算状态 协议=%s 用户=%s 状态=可清算 hf=%.6f usd=%.2f",
-            proto.chain,
+            "%s 清算状态 协议=%s 用户=%s 状态=可清算 hf=%.6f usd=%.2f",
+            self.chain.alias,
             proto.name,
             user,
             hf,
@@ -1120,7 +1225,7 @@ class MarketScanner:
             ("liq", proto.chain, proto.name, user),
             (
                 f"<b>可清算仓位</b>\n"
-                f"chain: {html.escape(proto.chain)}\n"
+                f"chain: {html.escape(self.chain.alias)}\n"
                 f"protocol: {html.escape(proto.name)}\n"
                 f"user: <code>{html.escape(user)}</code>\n"
                 f"hf: {hf:.6f}\n"
@@ -1163,8 +1268,8 @@ class MarketScanner:
         error, _liquidity, shortfall = decode(["uint256", "uint256", "uint256"], raw)
         if int(error) != 0 or int(shortfall) == 0:
             self._logger.info(
-                "[%s] 清算状态 协议=%s 用户=%s 状态=安全",
-                proto.chain,
+                "%s 清算状态 协议=%s 用户=%s 状态=安全",
+                self.chain.alias,
                 proto.name,
                 user,
             )
@@ -1216,8 +1321,8 @@ class MarketScanner:
             collateral_usd = int(shortfall) / WAD
         if not exceeds_min_usd(collateral_usd, self.config.min_usd):
             self._logger.info(
-                "[%s] 清算状态 协议=%s 用户=%s 状态=低于美元门槛 已丢弃 usd=%.2f",
-                proto.chain,
+                "%s 清算状态 协议=%s 用户=%s 状态=低于美元门槛 已丢弃 usd=%.2f",
+                self.chain.alias,
                 proto.name,
                 user,
                 collateral_usd,
@@ -1227,8 +1332,8 @@ class MarketScanner:
             return
         hf = 0.0
         self._logger.info(
-            "[%s] 清算状态 协议=%s 用户=%s 状态=可清算 shortfall=%s usd=%.2f",
-            proto.chain,
+            "%s 清算状态 协议=%s 用户=%s 状态=可清算 shortfall=%s usd=%.2f",
+            self.chain.alias,
             proto.name,
             user,
             shortfall,
@@ -1238,7 +1343,7 @@ class MarketScanner:
             ("liq", proto.chain, proto.name, user),
             (
                 f"<b>可清算仓位</b>\n"
-                f"chain: {html.escape(proto.chain)}\n"
+                f"chain: {html.escape(self.chain.alias)}\n"
                 f"protocol: {html.escape(proto.name)}\n"
                 f"user: <code>{html.escape(user)}</code>\n"
                 f"shortfall_wad: {int(shortfall)}\n"
@@ -1283,7 +1388,7 @@ class MarketScanner:
         start = self.config.start_block
         if start is None:
             return
-        head = int(await self.chain.rpc(lambda: await_block_number(self.chain.w3), label="block_number"))
+        head = int(await self.chain.rpc(lambda w3=self.chain.w3: await_block_number(w3), label="block_number"))
         end = self.config.end_block if self.config.end_block is not None else head
         end = min(end, head)
         await self.scan_range(start, end)
@@ -1300,7 +1405,7 @@ class MarketScanner:
 
     async def _run_live_ws(self, stop: asyncio.Event, last: int) -> int:
         """newHeads subscription signals height; blocks are still read in order over HTTP."""
-        self._logger.info("[%s] 订阅 newHeads  websocket", self.chain.name)
+        self._logger.info("%s 订阅 newHeads websocket", self.chain.alias)
         async with AsyncWeb3(WebSocketProvider(self.chain.ws_url)) as ws_w3:
             await ws_w3.eth.subscribe("newHeads")
             waiter = asyncio.create_task(stop.wait())
@@ -1314,7 +1419,8 @@ class MarketScanner:
                         number = result.get("number")
                     if number is None:
                         number = await self.chain.rpc(
-                            lambda: await_block_number(self.chain.w3), label="block_number"
+                            lambda w3=self.chain.w3: await_block_number(w3),
+                            label="block_number",
                         )
                     last = await self._handle_new_head(last, int(number))
                     if waiter.done():
@@ -1329,9 +1435,9 @@ class MarketScanner:
         return last
 
     async def run_live(self, stop: asyncio.Event) -> None:
-        head = int(await self.chain.rpc(lambda: await_block_number(self.chain.w3), label="block_number"))
+        head = int(await self.chain.rpc(lambda w3=self.chain.w3: await_block_number(w3), label="block_number"))
         last = head
-        self._logger.info("[%s] 区块高度 %s 进入实时顺序监视", self.chain.name, last)
+        self._logger.info("%s 区块高度 %s 进入实时顺序监视", self.chain.alias, last)
         while not stop.is_set():
             try:
                 if self.chain.ws_url:
@@ -1348,16 +1454,16 @@ class MarketScanner:
                         }:
                             raise
                         self._logger.warning(
-                            "[%s] newHeads 失败 (%s)，改用 HTTP 轮询",
-                            self.chain.name,
+                            "%s newHeads 失败 (%s)，改用 HTTP 轮询",
+                            self.chain.alias,
                             type(exc).__name__,
                         )
-                head = int(await self.chain.rpc(lambda: await_block_number(self.chain.w3), label="block_number"))
+                head = int(await self.chain.rpc(lambda w3=self.chain.w3: await_block_number(w3), label="block_number"))
                 last = await self._handle_new_head(last, head)
             except TransientRpcError:
-                self._logger.warning("[%s] 实时循环瞬时错误，重试", self.chain.name)
+                self._logger.warning("%s 实时循环瞬时错误，重试", self.chain.alias)
             except Exception:
-                self._logger.exception("[%s] 实时循环逻辑错误", self.chain.name)
+                self._logger.exception("%s 实时循环逻辑错误", self.chain.alias)
                 raise
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.config.poll_interval_sec)
@@ -1419,19 +1525,32 @@ class Keeper:
                 ("bsc", config.bnb_rpc_url, config.bnb_ws_url),
             )
             for name, url, ws in mapping:
+                bound_name = name
                 if not url:
-                    logger.info("[%s] 未配置 dRPC HTTP，跳过", name)
+                    logger.info("%s 未配置 dRPC HTTP，跳过", chain_alias(bound_name))
                     continue
-                chain = EvmChain(name, url, ws, session, logger)
+                chain = EvmChain(bound_name, url, ws, session, logger)
+                bound_alias = chain.alias
+                bound_w3 = chain.w3
                 await chain.attach_session()
                 try:
-                    chain.chain_id = int(await chain.rpc(lambda: chain.w3.eth.chain_id, label="chain_id"))
-                    head = int(await chain.rpc(lambda: await_block_number(chain.w3), label="block_number"))
-                    logger.info("[%s] 区块高度 %s 已连接 chain_id=%s", name, head, chain.chain_id)
+                    chain.chain_id = int(
+                        await chain.rpc(lambda w3=bound_w3: w3.eth.chain_id, label="chain_id")
+                    )
+                    head = int(
+                        await chain.rpc(
+                            lambda w3=bound_w3: await_block_number(w3), label="block_number"
+                        )
+                    )
+                    logger.info("%s 区块高度 %s 已连接 chain_id=%s", bound_alias, head, chain.chain_id)
                 except TransientRpcError:
-                    logger.warning("[%s] 初始连接失败，循环内重试", name)
-                engine = SimulationEngine(chain, operator, account, config.dry_run, logger, telegram)
-                scanner = MarketScanner(chain, config, config.protocols_for(name), engine, logger, telegram)
+                    logger.warning("%s 初始连接失败，循环内重试", bound_alias)
+                engine = SimulationEngine(
+                    chain, operator, account, config.dry_run, logger, telegram, config.min_native
+                )
+                scanner = MarketScanner(
+                    chain, config, config.protocols_for(bound_name), engine, logger, telegram
+                )
                 await scanner.refresh_markets()
                 chains.append((chain, scanner))
 
@@ -1449,10 +1568,11 @@ class Keeper:
                 raise SystemExit("no RPC URLs configured (set ETH_RPC_URL / BNB_RPC_URL / SOL_RPC_URL)")
 
             logger.info(
-                "keeper start dry_run=%s operator=%s min_usd=%s sequential=true",
+                "keeper start dry_run=%s operator=%s min_usd=%s min_native=%s sequential=true",
                 config.dry_run,
                 operator or "<unset>",
                 config.min_usd,
+                config.min_native,
             )
             if not config.dry_run:
                 logger.warning("DRY_RUN 已关闭 — 模拟成功后将用操作者私钥广播")
