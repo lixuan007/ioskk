@@ -166,6 +166,12 @@ CHAIN_ALIASES: Final[dict[str, str]] = {
     "sol": "【SOL 链】",
 }
 
+# chain_id wins over the constructor name so concurrent scanners cannot swap labels.
+CHAIN_ID_ALIASES: Final[dict[int, str]] = {
+    1: "【ETH 链】",
+    56: "【BNB 链】",
+}
+
 
 def chain_alias(chain: Any) -> str:
     """User-facing chain label from the per-chain object, never a shared global.
@@ -175,10 +181,35 @@ def chain_alias(chain: Any) -> str:
     bound = getattr(chain, "alias", None)
     if isinstance(bound, str) and bound.startswith("【"):
         return bound
+    chain_id = getattr(chain, "chain_id", None)
+    if chain_id is not None:
+        try:
+            locked = CHAIN_ID_ALIASES.get(int(chain_id))
+        except (TypeError, ValueError):
+            locked = None
+        if locked:
+            return locked
     raw = getattr(chain, "name", None)
     key = str(raw if raw is not None else chain).strip().lower()
     key = key.replace("【", "").replace("】", "").replace(" 链", "").replace("链", "")
     return CHAIN_ALIASES.get(key, f"【{key} 链】")
+
+
+def bind_chain_alias(name: Any, chain_id: int | None = None) -> str:
+    """Freeze 【ETH 链】 / 【BNB 链】 from chain_id when known, else from the name."""
+    if chain_id is not None:
+        try:
+            locked = CHAIN_ID_ALIASES.get(int(chain_id))
+        except (TypeError, ValueError):
+            locked = None
+        if locked:
+            return locked
+    return chain_alias(name)
+
+
+def synced_block_line(alias: str, height: int, kept: int = 0, dropped: int = 0) -> str:
+    """BaoTa line: 【BNB 链】成功同步区块 / 【ETH 链】成功同步区块."""
+    return f"{alias}成功同步区块 {int(height)} 保留协议交易={int(kept)} 丢弃普通转账={int(dropped)}"
 
 
 def native_ether_amount(wei: int) -> float:
@@ -187,10 +218,40 @@ def native_ether_amount(wei: int) -> float:
 
 
 def exceeds_native_floor(wei: int, min_native: float) -> bool:
-    """True only when official pool/cToken native coin is strictly greater than the floor."""
+    """True only when a wei amount is strictly greater than the native-coin floor."""
     if min_native <= 0:
         return True
     return native_ether_amount(wei) > min_native
+
+
+def position_native_amount(
+    collateral_base: int,
+    base: str,
+    eth_usd: float,
+) -> float:
+    """Official-position size in native ETH/BNB. Uses from_wei for eth18 bases."""
+    if base == "eth18":
+        return native_ether_amount(int(collateral_base))
+    usd = int(collateral_base) / USD8
+    if eth_usd <= 0:
+        return 0.0
+    wei = int((usd / eth_usd) * WAD)
+    return native_ether_amount(wei)
+
+
+def native_from_usd(collateral_usd: float, eth_usd: float) -> float:
+    """USD collateral → native ETH/BNB via from_wei(usd/eth_usd * 1e18)."""
+    if eth_usd <= 0:
+        return 0.0
+    wei = int((float(collateral_usd) / eth_usd) * WAD)
+    return native_ether_amount(wei)
+
+
+def exceeds_position_native(native: float, min_native: float) -> bool:
+    """True only when the official position's native-coin size is > MIN_NATIVE."""
+    if min_native <= 0:
+        return True
+    return float(native) > min_native
 
 
 def normalize_tx_to(tx_to: Any) -> str | None:
@@ -447,12 +508,14 @@ class NonJsonRpcError(RuntimeError):
 
 
 def rpc_url_env_for_alias(alias: str) -> str:
-    if "ETH" in alias:
-        return "ETH_RPC_URL"
-    if "BNB" in alias:
+    text = str(alias)
+    # BNB / SOL first: the substring "ETH" must not steal 【BNB 链】 or similar.
+    if "BNB" in text or "BSC" in text:
         return "BNB_RPC_URL"
-    if "SOL" in alias:
+    if "SOL" in text:
         return "SOL_RPC_URL"
+    if "ETH" in text:
+        return "ETH_RPC_URL"
     return "RPC_URL"
 
 
@@ -721,19 +784,39 @@ class AppConfig:
 # ---------------------------------------------------------------------------
 
 class RealtimeStreamHandler(logging.StreamHandler):
-    """Flush after every record so BaoTa / process-manager stdout updates immediately."""
+    """Flush after every Chinese 区块/清算 line so BaoTa stdout is not buffered."""
 
     def emit(self, record: logging.LogRecord) -> None:
-        super().emit(record)
-        self.flush()
+        try:
+            super().emit(record)
+        finally:
+            try:
+                self.flush()
+                stream = getattr(self, "stream", None)
+                if stream is not None:
+                    stream.flush()
+            except Exception:
+                pass
 
 
 class RealtimeFileHandler(logging.FileHandler):
-    """Flush after every record so tail -f / 宝塔日志 does not buffer."""
+    """Flush + fsync after every record so tail -f / 宝塔日志 renders immediately."""
 
     def emit(self, record: logging.LogRecord) -> None:
-        super().emit(record)
-        self.flush()
+        try:
+            super().emit(record)
+        finally:
+            try:
+                self.flush()
+                stream = getattr(self, "stream", None)
+                if stream is None:
+                    return
+                stream.flush()
+                fileno = getattr(stream, "fileno", None)
+                if callable(fileno):
+                    os.fsync(fileno())
+            except Exception:
+                pass
 
 
 # Back-compat aliases for earlier helper names.
@@ -759,6 +842,7 @@ def setup_logging(config: AppConfig) -> logging.Logger:
         logger.addHandler(file_handler)
     for name in ("web3", "web3.providers", "web3.providers.HTTPProvider", "aiohttp"):
         noisy = logging.getLogger(name)
+        noisy.setLevel(logging.WARNING)
         noisy.addFilter(html_filter)
     return logger
 
@@ -1001,7 +1085,7 @@ class EvmChain:
         logger: logging.Logger,
     ) -> None:
         self.name = name
-        self.alias = chain_alias(name)
+        self.alias = bind_chain_alias(name)
         self.rpc_url = rpc_url
         self.ws_url = ws_url
         self._session = session
@@ -1009,6 +1093,13 @@ class EvmChain:
         self.w3 = self._make_w3()
         self.chain_id: int | None = None
         self._rpc_issue_seen: dict[tuple[str, str], float] = {}
+
+    def bind_alias(self, chain_id: int | None = None) -> str:
+        """Lock 【ETH 链】 / 【BNB 链】 from the live chain_id so logs cannot swap."""
+        if chain_id is not None:
+            self.chain_id = int(chain_id)
+        self.alias = bind_chain_alias(self.name, self.chain_id)
+        return self.alias
 
     def _make_w3(self) -> AsyncWeb3:
         provider = SanitizingAsyncHTTPProvider(
@@ -1076,12 +1167,14 @@ class SimulationEngine:
         logger: logging.Logger,
         telegram: TelegramAlerter,
         min_native: float = 0.05,
+        eth_usd: float = 3000.0,
     ) -> None:
         self.chain = chain
         self.operator = operator
         self.account = account
         self.dry_run = dry_run
         self.min_native = min_native
+        self.eth_usd = eth_usd
         self._logger = logger
         self._telegram = telegram
 
@@ -1100,25 +1193,17 @@ class SimulationEngine:
             position.user, position.repay_amount, position.collateral
         )
 
-    async def _target_native_ok(self, contract: str) -> bool:
-        """Last gate before eth_call: watched official contract native coin > MIN_NATIVE."""
-        addr = to_checksum_address(contract)
-        w3 = self.chain.w3
-
-        async def _bal() -> int:
-            return int(await w3.eth.get_balance(addr))
-
-        try:
-            wei = int(await self.chain.rpc(_bal, label="get_balance"))
-        except TransientRpcError:
-            return False
-        if exceeds_native_floor(wei, self.min_native):
+    def _position_native_ok(self, position: CandidatePosition) -> bool:
+        """Last gate before liquidation eth_call: official position native > MIN_NATIVE."""
+        native = native_from_usd(position.collateral_usd, self.eth_usd)
+        if exceeds_position_native(native, self.min_native):
             return True
-        self._logger.info(
-            "%s 清算状态 合约=%s 状态=低于原生币门槛 已丢弃 native=%.6f 门槛=%s",
+        self._logger.debug(
+            "%s 清算状态 协议=%s 用户=%s 状态=低于原生币门槛 已丢弃 native=%.6f 门槛=%s",
             self.chain.alias,
-            addr,
-            native_ether_amount(wei),
+            position.protocol,
+            position.user,
+            native,
             self.min_native,
         )
         return False
@@ -1127,7 +1212,7 @@ class SimulationEngine:
         if not self.operator:
             self._logger.warning("skip sim: EVM_ADDRESS empty")
             return False
-        if not await self._target_native_ok(position.target):
+        if not self._position_native_ok(position):
             return False
         data = self._calldata(position)
         tx: TxParams = {
@@ -1251,7 +1336,7 @@ class MarketScanner:
         self._watched: set[str] = set()
         self._to_proto: dict[str, ProtocolMarket] = {}
         self._eval_seen = DedupCache(200)
-        self._native_ok: dict[str, bool] = {}
+        self._dust_seen: dict[str, float] = {}
 
     async def refresh_markets(self) -> None:
         self._watched.clear()
@@ -1317,9 +1402,27 @@ class MarketScanner:
         """Scan Aave-spec lending state in block order. No unbounded fan-out."""
         if end < start:
             return
-        self._logger.info("%s 区块高度 %s..%s 顺序扫描", self.chain.alias, start, end)
+        self._logger.info("%s区块高度 %s..%s 顺序扫描", self.chain.alias, start, end)
         for height in range(start, end + 1):
             await self.scan_block(height)
+
+    async def process_single_tx(self, tx: Any) -> tuple[bool, ProtocolMarket | None, set[str]]:
+        """Official pool/cToken tx only. Empty-`to` creations and unknown `to` return immediately.
+
+        Does not sweep random contracts. Native > MIN_NATIVE is applied on the official
+        position (from_wei) before liquidation eth_call, not on the pool's leftover ETH.
+        """
+        tx_to = tx["to"] if isinstance(tx, dict) else getattr(tx, "to", None)
+        if not keep_protocol_tx(tx_to, self._watched):
+            return False, None, set()
+        target = normalize_tx_to(tx_to)
+        if target is None:
+            return False, None, set()
+        proto = self._to_proto.get(target.lower())
+        if proto is None:
+            return False, None, set()
+        users = await self._users_from_kept_tx(proto, tx)
+        return True, proto, users
 
     async def scan_block(self, height: int) -> None:
         async def _fetch() -> Any:
@@ -1328,71 +1431,24 @@ class MarketScanner:
         try:
             block = await self.chain.rpc(_fetch, label="get_block")
         except TransientRpcError:
-            self._logger.warning("%s 区块高度 %s 读取失败已跳过", self.chain.alias, height)
+            self._logger.warning("%s区块高度 %s 读取失败已跳过", self.chain.alias, height)
             return
         txs = list(block["transactions"] if isinstance(block, dict) else block.transactions)
         kept = 0
         dropped = 0
         found: dict[tuple[str, str], set[str]] = {}
-        self._native_ok.clear()
         for tx in txs:
-            tx_to = tx["to"] if isinstance(tx, dict) else getattr(tx, "to", None)
-            if not keep_protocol_tx(tx_to, self._watched):
+            kept_tx, proto, users = await self.process_single_tx(tx)
+            if not kept_tx or proto is None:
                 dropped += 1
-                continue
-            target = normalize_tx_to(tx_to)
-            if target is None:
-                dropped += 1
-                continue
-            if not await self._official_native_ok(target):
                 continue
             kept += 1
-            proto = self._to_proto.get(target.lower())
-            if proto is None:
-                continue
-            users = await self._users_from_kept_tx(proto, tx)
             found.setdefault((proto.name, proto.address), set()).update(users)
-        self._logger.info(
-            "%s 区块高度 %s 保留协议交易=%s 丢弃普通转账=%s",
-            self.chain.alias,
-            height,
-            kept,
-            dropped,
-        )
+        self._logger.info("%s", synced_block_line(self.chain.alias, height, kept, dropped))
         for (name, address), users in found.items():
             proto = next(p for p in self.protocols if p.address == address and p.name == name)
             for user in users:
                 await self._evaluate_user(proto, user)
-
-    async def _official_native_ok(self, contract: str) -> bool:
-        """Pre-sim: only watched official pool/cToken native coin strictly above MIN_NATIVE."""
-        key = contract.lower()
-        cached = self._native_ok.get(key)
-        if cached is not None:
-            return cached
-        addr = to_checksum_address(contract)
-        w3 = self.chain.w3
-
-        async def _bal() -> int:
-            return int(await w3.eth.get_balance(addr))
-
-        try:
-            wei = int(await self.chain.rpc(_bal, label="get_balance"))
-        except TransientRpcError:
-            self._native_ok[key] = False
-            return False
-        amount = native_ether_amount(wei)
-        ok = exceeds_native_floor(wei, self.config.min_native)
-        self._native_ok[key] = ok
-        if not ok:
-            self._logger.info(
-                "%s 清算状态 合约=%s 状态=低于原生币门槛 已丢弃 native=%.6f 门槛=%s",
-                self.chain.alias,
-                addr,
-                amount,
-                self.config.min_native,
-            )
-        return ok
 
     async def _users_from_kept_tx(self, proto: ProtocolMarket, tx: Any) -> set[str]:
         users: set[str] = set()
@@ -1446,6 +1502,33 @@ class MarketScanner:
             raise
         return None
 
+    def _log_dust(self, proto: ProtocolMarket, user: str, native: float) -> None:
+        """Cooldown so 0.0003-native dust does not flood BaoTa."""
+        key = f"{self.chain.alias}|{proto.name}|{user}"
+        now = time.monotonic()
+        last = self._dust_seen.get(key, 0.0)
+        if now - last < 60.0:
+            return
+        self._dust_seen[key] = now
+        self._logger.debug(
+            "%s 清算状态 协议=%s 用户=%s 状态=低于原生币门槛 已丢弃 native=%.6f 门槛=%s",
+            self.chain.alias,
+            proto.name,
+            user,
+            native,
+            self.config.min_native,
+        )
+
+    def _position_clears_native(self, proto: ProtocolMarket, user: str, collateral_usd: float, collateral_base: int | None = None) -> bool:
+        if collateral_base is not None:
+            native = position_native_amount(collateral_base, proto.base, self.config.eth_usd)
+        else:
+            native = native_from_usd(collateral_usd, self.config.eth_usd)
+        if exceeds_position_native(native, self.config.min_native):
+            return True
+        self._log_dust(proto, user, native)
+        return False
+
     async def _evaluate_user(self, proto: ProtocolMarket, user: str) -> None:
         fp = fingerprint("eval", proto.chain, proto.name, user)
         if self._eval_seen.add(fp):
@@ -1478,7 +1561,7 @@ class MarketScanner:
         ) = decode(["uint256", "uint256", "uint256", "uint256", "uint256", "uint256"], raw)
         collateral_usd = self._collateral_usd(proto, int(total_collateral_base))
         if not exceeds_min_usd(collateral_usd, self.config.min_usd):
-            self._logger.info(
+            self._logger.debug(
                 "%s 清算状态 协议=%s 用户=%s 状态=低于美元门槛 已丢弃 usd=%.2f",
                 self.chain.alias,
                 proto.name,
@@ -1486,8 +1569,10 @@ class MarketScanner:
                 collateral_usd,
             )
             return
+        if not self._position_clears_native(proto, user, collateral_usd, int(total_collateral_base)):
+            return
         if int(total_debt_base) == 0 or int(health_factor) >= WAD:
-            self._logger.info(
+            self._logger.debug(
                 "%s 清算状态 协议=%s 用户=%s 状态=安全",
                 self.chain.alias,
                 proto.name,
@@ -1549,7 +1634,7 @@ class MarketScanner:
         )
         error, _liquidity, shortfall = decode(["uint256", "uint256", "uint256"], raw)
         if int(error) != 0 or int(shortfall) == 0:
-            self._logger.info(
+            self._logger.debug(
                 "%s 清算状态 协议=%s 用户=%s 状态=安全",
                 self.chain.alias,
                 proto.name,
@@ -1602,13 +1687,15 @@ class MarketScanner:
         if collateral_usd <= 0:
             collateral_usd = int(shortfall) / WAD
         if not exceeds_min_usd(collateral_usd, self.config.min_usd):
-            self._logger.info(
+            self._logger.debug(
                 "%s 清算状态 协议=%s 用户=%s 状态=低于美元门槛 已丢弃 usd=%.2f",
                 self.chain.alias,
                 proto.name,
                 user,
                 collateral_usd,
             )
+            return
+        if not self._position_clears_native(proto, user, collateral_usd):
             return
         if not collaterals or not debts:
             return
@@ -1716,10 +1803,14 @@ class MarketScanner:
                     pass
         return last
 
+    async def monitor_evm_market(self, stop: asyncio.Event) -> None:
+        """Bound per-chain loop. Logs always use this scanner's EvmChain.alias."""
+        await self.run_live(stop)
+
     async def run_live(self, stop: asyncio.Event) -> None:
         head = int(await self.chain.rpc(lambda w3=self.chain.w3: await_block_number(w3), label="block_number"))
         last = head
-        self._logger.info("%s 区块高度 %s 进入实时顺序监视", self.chain.alias, last)
+        self._logger.info("%s成功同步区块 %s 进入实时顺序监视", self.chain.alias, last)
         while not stop.is_set():
             try:
                 if self.chain.ws_url:
@@ -1836,23 +1927,30 @@ class Keeper:
                     )
                     continue
                 chain = EvmChain(bound_name, url, ws, session, logger)
-                bound_alias = chain.alias
                 bound_w3 = chain.w3
                 await chain.attach_session()
                 try:
                     chain.chain_id = int(
                         await chain.rpc(lambda w3=bound_w3: w3.eth.chain_id, label="chain_id")
                     )
+                    chain.bind_alias(chain.chain_id)
                     head = int(
                         await chain.rpc(
                             lambda w3=bound_w3: await_block_number(w3), label="block_number"
                         )
                     )
-                    logger.info("%s 区块高度 %s 已连接 chain_id=%s", bound_alias, head, chain.chain_id)
+                    logger.info("%s成功同步区块 %s 已连接 chain_id=%s", chain.alias, head, chain.chain_id)
                 except TransientRpcError:
-                    logger.warning("%s 初始连接失败，循环内重试", bound_alias)
+                    logger.warning("%s 初始连接失败，循环内重试", chain.alias)
                 engine = SimulationEngine(
-                    chain, operator, account, config.dry_run, logger, telegram, config.min_native
+                    chain,
+                    operator,
+                    account,
+                    config.dry_run,
+                    logger,
+                    telegram,
+                    config.min_native,
+                    config.eth_usd,
                 )
                 scanner = MarketScanner(
                     chain, config, config.protocols_for(bound_name), engine, logger, telegram
@@ -1899,7 +1997,7 @@ class Keeper:
                 if run_live and not stop.is_set():
                     async with asyncio.TaskGroup() as group:
                         for _chain, scanner in chains:
-                            group.create_task(scanner.run_live(stop))
+                            group.create_task(scanner.monitor_evm_market(stop))
                         if config.sol_rpc_url:
                             group.create_task(sol.run_live(stop, config.poll_interval_sec))
                         group.create_task(stop.wait())

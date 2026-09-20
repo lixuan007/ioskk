@@ -72,6 +72,20 @@ def test_chain_alias_is_per_object_not_global() -> None:
     assert main.chain_alias(confused) == "【BNB 链】"
 
 
+def test_bind_chain_alias_locks_from_chain_id() -> None:
+    assert main.bind_chain_alias("ethereum", 1) == "【ETH 链】"
+    assert main.bind_chain_alias("ethereum", 56) == "【BNB 链】"
+    assert main.bind_chain_alias("bsc", 1) == "【ETH 链】"
+    assert main.bind_chain_alias("bsc") == "【BNB 链】"
+    line_bnb = main.synced_block_line("【BNB 链】", 123, 1, 9)
+    line_eth = main.synced_block_line("【ETH 链】", 456, 0, 12)
+    assert line_bnb.startswith("【BNB 链】成功同步区块 123")
+    assert line_eth.startswith("【ETH 链】成功同步区块 456")
+    assert "【ETH 链】" not in line_bnb
+    assert main.rpc_url_env_for_alias("【BNB 链】") == "BNB_RPC_URL"
+    assert main.rpc_url_env_for_alias("【ETH 链】") == "ETH_RPC_URL"
+
+
 def test_native_floor_strictly_greater_than_default() -> None:
     wei_ok = int(main.AsyncWeb3.to_wei(0.06, "ether"))
     wei_eq = int(main.AsyncWeb3.to_wei(0.05, "ether"))
@@ -81,6 +95,15 @@ def test_native_floor_strictly_greater_than_default() -> None:
     assert main.exceeds_native_floor(wei_low, 0.05) is False
     assert main.native_ether_amount(wei_eq) == pytest.approx(0.05)
     assert main.exceeds_native_floor(wei_low, 0.0) is True
+    dust_usd = 0.0003 * 3000.0
+    assert main.exceeds_position_native(main.native_from_usd(dust_usd, 3000.0), 0.05) is False
+    assert main.exceeds_position_native(main.native_from_usd(200.0, 3000.0), 0.05) is True
+    eth18_ok = int(main.AsyncWeb3.to_wei(0.06, "ether"))
+    eth18_dust = int(main.AsyncWeb3.to_wei(0.0003, "ether"))
+    assert main.position_native_amount(eth18_ok, "eth18", 3000.0) == pytest.approx(0.06)
+    assert main.exceeds_position_native(main.position_native_amount(eth18_dust, "eth18", 3000.0), 0.05) is False
+    usd8 = int(180 * 10**8)
+    assert main.exceeds_position_native(main.position_native_amount(usd8, "usd8", 3000.0), 0.05) is True
 
 
 def test_exceeds_min_usd_floor() -> None:

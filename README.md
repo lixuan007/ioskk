@@ -35,7 +35,7 @@ cp .env.example .env
 python main.py
 ```
 
-With no `START_BLOCK`, the process follows new heads (WebSocket `newHeads` when `ETH_WS_URL` / `BNB_WS_URL` is set, otherwise HTTP poll). Each height is read **in block order**. Ordinary transfers are dropped by inspecting `tx.to` (empty-`to` creations and EOA-to-EOA never become targets). Only txs to configured official pools/cTokens are kept. Before `eth_call`, the watched pool/cToken native balance must be **greater than** `MIN_NATIVE` (default `0.05` ETH or 0.05 BNB). Dust contracts log `低于原生币门槛` and are not simulated.
+With no `START_BLOCK`, the process follows new heads (WebSocket `newHeads` when `ETH_WS_URL` / `BNB_WS_URL` is set, otherwise HTTP poll). Each height is read **in block order**. Ordinary transfers are dropped by inspecting `tx.to` (empty-`to` creations and EOA-to-EOA never become targets). Only txs to configured official pools/cTokens are kept. Before liquidation `eth_call`, the official position’s native-coin size (ETH on Ethereum, BNB on BNB, via `from_wei`) must be **greater than** `MIN_NATIVE` (default `0.05`). Dust 0.0003-size positions are dropped without a simulation. Each synced height logs `【ETH 链】成功同步区块` or `【BNB 链】成功同步区块` from the bound `chain_id`.
 
 Historical backfill:
 
@@ -65,7 +65,7 @@ Helpers (`encode_*`, dedup, USD filter, user-config bits, revert vs transient RP
 
 | Module | Role |
 | --- | --- |
-| A Scanner | Sequential block-order `get_block(full_transactions=True)`. Pre-filter by `tx.to` against watched official pools/cTokens. Native coin of that official contract must be `> MIN_NATIVE` (default 0.05) before any `eth_call`. Logs use bound 【ETH 链】 / 【BNB 链】 aliases. Live new-heads poll/subscribe + optional `start_block..end_block`. |
+| A Scanner | Sequential block-order `get_block(full_transactions=True)`. `process_single_tx` keeps official pool/cToken `tx.to` only. Official position native (from_wei) must be `> MIN_NATIVE` (default 0.05) before liquidation `eth_call`. Logs bind 【ETH 链】 / 【BNB 链】 from `chain_id` and print `成功同步区块`. |
 | B Simulator | Official `getUserAccountData` / `liquidationCall` / `liquidateBorrow` via `eth_call` from the operator. Revert = safe, discard. Send only after success and `DRY_RUN=false` with a matching operator key. |
 | C Logger / Telegram | `RealtimeStreamHandler` / `RealtimeFileHandler` flush every record (BaoTa). Chinese 区块高度 / 清算状态 lines. Telegram uses the process `self.session`, `create_task`, 2s timeout, MD5 deque(200). |
 
