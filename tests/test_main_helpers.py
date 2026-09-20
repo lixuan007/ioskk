@@ -1,0 +1,346 @@
+"""Unit tests for encoder, dedup, filter, and classifier helpers in main.py."""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+from unittest.mock import patch
+
+import pytest
+from eth_utils import function_signature_to_4byte_selector
+
+import main
+
+
+def test_aave_liquidation_selector_is_official() -> None:
+    assert main.AAVE_LIQUIDATION_SELECTOR == function_signature_to_4byte_selector(
+        "liquidationCall(address,address,address,uint256,bool)"
+    )
+    assert main.selector_hex(main.AAVE_LIQUIDATION_SIG) == "0x00a718a9"
+
+
+def test_compound_liquidate_selector_is_official() -> None:
+    assert main.COMPOUND_LIQUIDATE_SELECTOR == function_signature_to_4byte_selector(
+        "liquidateBorrow(address,uint256,address)"
+    )
+    assert main.selector_hex(main.COMPOUND_LIQUIDATE_SIG) == "0xf5e3c462"
+
+
+def test_encode_aave_liquidation_call_layout() -> None:
+    data = main.encode_aave_liquidation_call(
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        "0x1111111111111111111111111111111111111111",
+        10**6,
+        False,
+    )
+    assert data[:4] == main.AAVE_LIQUIDATION_SELECTOR
+    assert len(data) == 4 + 32 * 5
+
+
+def test_encode_compound_liquidate_borrow_layout() -> None:
+    data = main.encode_compound_liquidate_borrow(
+        "0x2222222222222222222222222222222222222222",
+        123,
+        "0x3333333333333333333333333333333333333333",
+    )
+    assert data[:4] == main.COMPOUND_LIQUIDATE_SELECTOR
+    assert len(data) == 4 + 32 * 3
+
+
+def test_chain_alias_is_per_object_not_global() -> None:
+    assert main.chain_alias("ethereum") == "【ETH 链】"
+    assert main.chain_alias("ETH") == "【ETH 链】"
+    assert main.chain_alias("bsc") == "【BNB 链】"
+    assert main.chain_alias("bnb") == "【BNB 链】"
+
+    class Bound:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.alias = main.chain_alias(name)
+
+    eth = Bound("ethereum")
+    bnb = Bound("bsc")
+    assert eth.alias == "【ETH 链】"
+    assert bnb.alias == "【BNB 链】"
+    assert main.chain_alias(eth) == "【ETH 链】"
+    assert main.chain_alias(bnb) == "【BNB 链】"
+    # Bound alias wins even if name is wrong (the concurrency bug).
+    confused = Bound("ethereum")
+    confused.alias = "【BNB 链】"
+    assert main.chain_alias(confused) == "【BNB 链】"
+
+
+def test_bind_chain_alias_locks_from_chain_id() -> None:
+    assert main.bind_chain_alias("ethereum", 1) == "【ETH 链】"
+    assert main.bind_chain_alias("ethereum", 56) == "【BNB 链】"
+    assert main.bind_chain_alias("bsc", 1) == "【ETH 链】"
+    assert main.bind_chain_alias("bsc") == "【BNB 链】"
+    line_bnb = main.synced_block_line("【BNB 链】", 123, 1, 9)
+    line_eth = main.synced_block_line("【ETH 链】", 456, 0, 12)
+    assert line_bnb.startswith("【BNB 链】成功同步区块 123")
+    assert line_eth.startswith("【ETH 链】成功同步区块 456")
+    assert "【ETH 链】" not in line_bnb
+    assert main.rpc_url_env_for_alias("【BNB 链】") == "BNB_RPC_URL"
+    assert main.rpc_url_env_for_alias("【ETH 链】") == "ETH_RPC_URL"
+
+
+def test_native_floor_strictly_greater_than_default() -> None:
+    wei_ok = int(main.AsyncWeb3.to_wei(0.06, "ether"))
+    wei_eq = int(main.AsyncWeb3.to_wei(0.05, "ether"))
+    wei_low = int(main.AsyncWeb3.to_wei(0.04, "ether"))
+    assert main.exceeds_native_floor(wei_ok, 0.05) is True
+    assert main.exceeds_native_floor(wei_eq, 0.05) is False
+    assert main.exceeds_native_floor(wei_low, 0.05) is False
+    assert main.native_ether_amount(wei_eq) == pytest.approx(0.05)
+    assert main.exceeds_native_floor(wei_low, 0.0) is True
+    dust_usd = 0.0003 * 3000.0
+    assert main.exceeds_position_native(main.native_from_usd(dust_usd, 3000.0), 0.05) is False
+    assert main.exceeds_position_native(main.native_from_usd(200.0, 3000.0), 0.05) is True
+    eth18_ok = int(main.AsyncWeb3.to_wei(0.06, "ether"))
+    eth18_dust = int(main.AsyncWeb3.to_wei(0.0003, "ether"))
+    assert main.position_native_amount(eth18_ok, "eth18", 3000.0) == pytest.approx(0.06)
+    assert main.exceeds_position_native(main.position_native_amount(eth18_dust, "eth18", 3000.0), 0.05) is False
+    usd8 = int(180 * 10**8)
+    assert main.exceeds_position_native(main.position_native_amount(usd8, "usd8", 3000.0), 0.05) is True
+
+
+def test_exceeds_min_usd_floor() -> None:
+    assert main.exceeds_min_usd(2.0, 2.0) is True
+    assert main.exceeds_min_usd(1.99, 2.0) is False
+    assert main.exceeds_min_usd(0.0, 0.0) is True
+    assert main.exceeds_min_usd(0.5, 0.0) is True
+
+
+def test_dedup_cache_evicts_and_fingerprints() -> None:
+    cache = main.DedupCache(maxlen=3)
+    fp = main.fingerprint("eth", "aave_v3", "0xAbc")
+    assert fp == main.fingerprint("ETH", "AAVE_V3", "0xabc")
+    assert cache.add(fp) is False
+    assert cache.add(fp) is True
+    assert cache.add("a") is False
+    assert cache.add("b") is False
+    assert cache.add("c") is False  # evicts fp
+    assert fp not in cache
+    assert cache.add(fp) is False
+
+
+def test_decode_user_config_bits() -> None:
+    reserves = [f"0x{i:040x}" for i in range(4)]
+    # reserve 0 collateral, reserve 1 debt, reserve 3 both
+    data = 0b00_11_00_01  # index 0 is low bits
+    # wait: index0 bits 0-1, index1 bits 2-3, index2 bits 4-5, index3 bits 6-7
+    # 0b 11 00 10 01 = index0 col, index1 debt, index3 both
+    data = 0b11001001
+    cols, debts = main.decode_user_config_bits(data, reserves)
+    assert cols[0].lower().endswith("00")
+    assert any(x.lower().endswith("03") for x in cols)
+    assert any(x.lower().endswith("01") for x in debts)
+    assert any(x.lower().endswith("03") for x in debts)
+    assert not any(x.lower().endswith("02") for x in cols + debts)
+
+
+def test_parse_compound_borrow_borrower() -> None:
+    from eth_abi import encode
+
+    borrower = "0x4444444444444444444444444444444444444444"
+    payload = encode(
+        ["address", "uint256", "uint256", "uint256"],
+        [borrower, 10, 20, 30],
+    )
+    assert main.parse_compound_borrow_borrower(payload) == main.to_checksum_address(borrower)
+    assert main.parse_compound_borrow_borrower("0x" + payload.hex()) == main.to_checksum_address(
+        borrower
+    )
+
+
+def test_env_bool_and_csv_addresses() -> None:
+    with patch.dict("os.environ", {"DRY_RUN": "false", "X": "yes"}, clear=False):
+        assert main.env_bool("DRY_RUN", True) is False
+        assert main.env_bool("X", False) is True
+    with patch.dict("os.environ", {"BAD": "maybe"}):
+        with pytest.raises(ValueError):
+            main.env_bool("BAD", True)
+    addrs = main.csv_addresses(
+        "0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2, 0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9"
+    )
+    assert len(addrs) == 2
+    assert addrs[0].startswith("0x")
+
+
+def test_html_rpc_body_is_classified_without_dumping_source() -> None:
+    html = "<!DOCTYPE html><html><head><title>BNB Chain</title></head><body>www.bnbchain.org</body></html>"
+    assert main.looks_like_html(html) is True
+    assert main.looks_like_non_json_rpc(html) is True
+    exc = RuntimeError("Could not decode " + html + " because of Expecting value")
+    assert main.classify_rpc_error(exc) == "html"
+    assert main.is_transient_rpc_error(exc) is True
+    hint = main.short_rpc_hint("【BNB 链】", "html")
+    assert hint == "【BNB 链】收到网页而非 JSON-RPC，请检查 BNB_RPC_URL"
+    assert "<!DOCTYPE" not in hint
+    assert "bnbchain.org" not in hint
+    assert main.short_rpc_hint("【ETH 链】", "ratelimit") == "【ETH 链】请求过于频繁(429)，将重连"
+    assert main.classify_rpc_error(main.NonJsonRpcError("html")) == "html"
+
+
+def test_omit_html_log_filter_drops_webpage_records() -> None:
+    filt = main.OmitHtmlLogFilter()
+    html_rec = logging.LogRecord(
+        "web3",
+        logging.ERROR,
+        __file__,
+        1,
+        "Could not decode %s",
+        ("<!DOCTYPE html><html>next</html>",),
+        None,
+    )
+    ok_rec = logging.LogRecord("keeper", logging.INFO, __file__, 1, "【BNB 链】区块高度 1", None, None)
+    assert filt.filter(html_rec) is False
+    assert filt.filter(ok_rec) is True
+
+
+def test_poa_extradata_is_transient() -> None:
+    class ExtraDataLengthError(Exception):
+        pass
+
+    exc = ExtraDataLengthError(
+        "The field extraData is 280 bytes, but should be 32. POA chain"
+    )
+    assert main._is_poa_extradata(exc) is True
+    assert main.classify_rpc_error(exc) == "transient"
+    assert main.is_transient_rpc_error(exc) is True
+
+
+def test_transient_vs_revert_classifier() -> None:
+    class ContractLogicError(Exception):
+        pass
+
+    revert = ContractLogicError("execution reverted: HF")
+    assert main.is_execution_revert(revert) is True
+    assert main.is_transient_rpc_error(revert) is False
+    assert main.is_transient_rpc_error(TimeoutError("timed out")) is True
+    assert main.is_transient_rpc_error(RuntimeError("429 Too Many Requests")) is True
+    assert main.is_transient_rpc_error(RuntimeError("Expecting value: line 1")) is True
+    assert main.is_transient_rpc_error(ValueError("unexpected keyword")) is False
+
+
+def test_keep_protocol_tx_drops_creations_and_ordinary_transfers() -> None:
+    pool = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
+    watched = {pool.lower()}
+    assert main.keep_protocol_tx(None, watched) is False
+    assert main.keep_protocol_tx("0x", watched) is False
+    assert main.keep_protocol_tx("", watched) is False
+    assert main.normalize_tx_to(None) is None
+    eoa = "0x1111111111111111111111111111111111111111"
+    assert main.keep_protocol_tx(eoa, watched) is False
+    assert main.keep_protocol_tx(pool, watched) is True
+    assert main.keep_protocol_tx(pool.lower(), watched) is True
+
+
+def test_realtime_and_flushing_handlers_flush() -> None:
+    buf = io.StringIO()
+    handler = main.RealtimeStreamHandler(buf)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    record = logging.LogRecord("keeper", logging.INFO, __file__, 1, "hello-flush", None, None)
+    handler.emit(record)
+    assert "hello-flush" in buf.getvalue()
+    assert issubclass(main.FlushingStreamHandler, logging.StreamHandler)
+    assert main.FlushingStreamHandler is main.RealtimeStreamHandler
+    assert main.FlushingFileHandler is main.RealtimeFileHandler
+
+
+@pytest.mark.asyncio
+async def test_solana_stub_refuses_submit() -> None:
+    stub = main.SolanaLiquidationStub("", logging.getLogger("test"))
+    assert await stub.fetch_liquidatable(2.0) == []
+    pos = main.SolanaPosition("ob", "repay", "withdraw", 1)
+    assert await stub.simulate_liquidate(pos) is False
+    with pytest.raises(RuntimeError, match="stubbed"):
+        await stub.submit_liquidate(pos)
+
+
+def test_parse_dotenv_quotes_comments_and_export() -> None:
+    text = """
+# comment
+ETH_RPC_URL="https://example.invalid/eth"
+BNB_RPC_URL='https://example.invalid/bnb'
+export SOL_RPC_URL=https://example.invalid/sol
+EMPTY=
+not_a_pair
+"""
+    parsed = main.parse_dotenv_text(text)
+    assert parsed["ETH_RPC_URL"] == "https://example.invalid/eth"
+    assert parsed["BNB_RPC_URL"] == "https://example.invalid/bnb"
+    assert parsed["SOL_RPC_URL"] == "https://example.invalid/sol"
+    assert parsed["EMPTY"] == ""
+    assert "not_a_pair" not in parsed
+    assert "#" not in "".join(parsed.keys())
+
+
+def test_apply_parsed_env_does_not_clobber(monkeypatch: pytest.MonkeyPatch) -> None:
+    env: dict[str, str] = {"ETH_RPC_URL": "already-set", "BNB_RPC_URL": ""}
+    applied = main.apply_parsed_env(
+        {"ETH_RPC_URL": "from-file", "BNB_RPC_URL": "from-file", "NEW_KEY": "yes"},
+        env,
+    )
+    assert env["ETH_RPC_URL"] == "already-set"
+    assert env["BNB_RPC_URL"] == "from-file"
+    assert env["NEW_KEY"] == "yes"
+    assert applied == 2
+
+
+def test_load_script_dir_env_uses_given_file(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KEEP_TEST_RPC", raising=False)
+    path = tmp_path / ".env"
+    path.write_text('KEEP_TEST_RPC="from-script-dir"\n', encoding="utf-8")
+    loaded, exists = main.load_script_dir_env(path)
+    assert exists is True
+    assert loaded == path
+    assert os.environ["KEEP_TEST_RPC"] == "from-script-dir"
+    monkeypatch.delenv("KEEP_TEST_RPC", raising=False)
+
+
+def test_missing_rpc_hint_has_path_not_secrets() -> None:
+    hint = main.missing_rpc_hint("【ETH 链】", "/www/wwwroot/okb/.env", True)
+    assert "已尝试 /www/wwwroot/okb/.env" in hint
+    assert "存在" in hint
+    assert "JSON-RPC" in hint
+    assert "https://" not in hint.lower()
+    assert "0x" not in hint
+    assert "dkey" not in hint.lower()
+    missing = main.missing_rpc_hint("【BNB 链】", "/www/wwwroot/okb/.env", False)
+    assert "不存在" in missing
+
+
+def test_resolve_rpc_url_prefers_configured_then_official() -> None:
+    assert main.resolve_rpc_url("", main.OFFICIAL_ETH_HTTP) == main.OFFICIAL_ETH_HTTP
+    assert main.resolve_rpc_url("  ", main.OFFICIAL_BNB_HTTP) == main.OFFICIAL_BNB_HTTP
+    custom = "https://example.invalid/eth"
+    assert main.resolve_rpc_url(custom, main.OFFICIAL_ETH_HTTP) == custom
+
+
+def test_config_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ETH_RPC_URL", raising=False)
+    monkeypatch.delenv("BNB_RPC_URL", raising=False)
+    monkeypatch.delenv("BSC_RPC_URL", raising=False)
+    monkeypatch.delenv("SOL_RPC_URL", raising=False)
+    monkeypatch.delenv("EVM_ADDRESS", raising=False)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.delenv("MIN_USD", raising=False)
+    monkeypatch.delenv("START_BLOCK", raising=False)
+    monkeypatch.delenv("CONCURRENCY", raising=False)
+    monkeypatch.delenv("MIN_NATIVE", raising=False)
+    cfg = main.AppConfig.from_env()
+    assert cfg.dry_run is True
+    assert cfg.min_usd == 2.0
+    assert cfg.min_native == 0.05
+    assert cfg.concurrency == 1
+    assert cfg.start_block is None
+    assert cfg.eth_rpc_url == main.OFFICIAL_ETH_HTTP
+    assert cfg.bnb_rpc_url == main.OFFICIAL_BNB_HTTP
+    assert cfg.sol_rpc_url == main.OFFICIAL_SOL_HTTP
+    assert "drpc.org" not in cfg.eth_rpc_url
+    assert "drpc.org" not in cfg.bnb_rpc_url
+    assert any(p.name == "aave_v3" for p in cfg.protocols_for("ethereum"))
+    assert any(p.name == "venus" for p in cfg.protocols_for("bsc"))
