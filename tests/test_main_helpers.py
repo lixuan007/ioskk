@@ -282,6 +282,7 @@ def test_missing_rpc_hint_has_path_not_secrets() -> None:
     hint = main.missing_rpc_hint("【ETH 链】", "/www/wwwroot/okb/.env", True)
     assert "已尝试 /www/wwwroot/okb/.env" in hint
     assert "存在" in hint
+    assert "JSON-RPC" in hint
     assert "https://" not in hint.lower()
     assert "0x" not in hint
     assert "dkey" not in hint.lower()
@@ -289,8 +290,18 @@ def test_missing_rpc_hint_has_path_not_secrets() -> None:
     assert "不存在" in missing
 
 
+def test_resolve_rpc_url_prefers_configured_then_official() -> None:
+    assert main.resolve_rpc_url("", main.OFFICIAL_ETH_HTTP) == main.OFFICIAL_ETH_HTTP
+    assert main.resolve_rpc_url("  ", main.OFFICIAL_BNB_HTTP) == main.OFFICIAL_BNB_HTTP
+    custom = "https://example.invalid/eth"
+    assert main.resolve_rpc_url(custom, main.OFFICIAL_ETH_HTTP) == custom
+
+
 def test_config_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ETH_RPC_URL", raising=False)
+    monkeypatch.delenv("BNB_RPC_URL", raising=False)
+    monkeypatch.delenv("BSC_RPC_URL", raising=False)
+    monkeypatch.delenv("SOL_RPC_URL", raising=False)
     monkeypatch.delenv("EVM_ADDRESS", raising=False)
     monkeypatch.delenv("DRY_RUN", raising=False)
     monkeypatch.delenv("MIN_USD", raising=False)
@@ -303,5 +314,10 @@ def test_config_from_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.min_native == 0.05
     assert cfg.concurrency == 1
     assert cfg.start_block is None
+    assert cfg.eth_rpc_url == main.OFFICIAL_ETH_HTTP
+    assert cfg.bnb_rpc_url == main.OFFICIAL_BNB_HTTP
+    assert cfg.sol_rpc_url == main.OFFICIAL_SOL_HTTP
+    assert "drpc.org" not in cfg.eth_rpc_url
+    assert "drpc.org" not in cfg.bnb_rpc_url
     assert any(p.name == "aave_v3" for p in cfg.protocols_for("ethereum"))
     assert any(p.name == "venus" for p in cfg.protocols_for("bsc"))

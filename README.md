@@ -24,7 +24,9 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Place .env next to main.py (script dir). RPC URLs must be a JSON-RPC gateway (dRPC ogrpc), not bnbchain.org or etherscan.
+# Place .env next to main.py (script dir). Defaults are official public JSON-RPC
+# (ethereum.publicnode.com / bsc-dataseed.binance.org / Solana mainnet-beta).
+# RPC must be a JSON-RPC gateway, not bnbchain.org or etherscan.
 ```
 
 ## Dry-run (default)

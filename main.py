@@ -85,6 +85,11 @@ WAD: Final = 10**18
 USD8: Final = 10**8
 UINT256_MAX: Final = 2**256 - 1
 
+# Official public JSON-RPC gateways (no API key). Override with ETH/BNB/SOL_RPC_URL.
+OFFICIAL_ETH_HTTP: Final = "https://ethereum.publicnode.com"
+OFFICIAL_BNB_HTTP: Final = "https://bsc-dataseed.binance.org"
+OFFICIAL_SOL_HTTP: Final = "https://api.mainnet-beta.solana.com"
+
 
 # ---------------------------------------------------------------------------
 # Testable helpers
@@ -333,9 +338,15 @@ def load_script_dir_env(
     return env_path, env_path.is_file()
 
 
+def resolve_rpc_url(configured: str, official: str) -> str:
+    """Use the operator URL when set; otherwise the official public JSON-RPC gateway."""
+    url = (configured or "").strip()
+    return url or official
+
+
 def missing_rpc_hint(alias: str, env_path: Path | str, exists: bool) -> str:
     status = "存在" if exists else "不存在"
-    return f"{alias} 未配置 dRPC HTTP，已尝试 {env_path}（{status}）"
+    return f"{alias} 未配置 JSON-RPC HTTP，已尝试 {env_path}（{status}）"
 
 
 def env_int(name: str, default: int | None = None) -> int | None:
@@ -650,9 +661,11 @@ class AppConfig:
     def from_env(cls) -> "AppConfig":
         evm_addr = env_str("EVM_ADDRESS")
         return cls(
-            eth_rpc_url=env_str("ETH_RPC_URL"),
-            bnb_rpc_url=env_str("BNB_RPC_URL") or env_str("BSC_RPC_URL"),
-            sol_rpc_url=env_str("SOL_RPC_URL"),
+            eth_rpc_url=resolve_rpc_url(env_str("ETH_RPC_URL"), OFFICIAL_ETH_HTTP),
+            bnb_rpc_url=resolve_rpc_url(
+                env_str("BNB_RPC_URL") or env_str("BSC_RPC_URL"), OFFICIAL_BNB_HTTP
+            ),
+            sol_rpc_url=resolve_rpc_url(env_str("SOL_RPC_URL"), OFFICIAL_SOL_HTTP),
             eth_ws_url=env_str("ETH_WS_URL"),
             bnb_ws_url=env_str("BNB_WS_URL"),
             evm_address=to_checksum_address(evm_addr) if evm_addr else "",
@@ -1792,6 +1805,19 @@ class Keeper:
                 session, config.telegram_bot_token, config.telegram_chat_id, logger
             )
             telegram = self.telegram
+            if telegram.enabled:
+                logger.info("Telegram 推送已启用")
+                telegram.notify(
+                    ("startup", config.dry_run, operator or "<unset>"),
+                    (
+                        "<b>官方清算 Keeper 已启动</b>\n"
+                        f"dry_run: {config.dry_run}\n"
+                        f"operator: <code>{html.escape(operator or '&lt;unset&gt;')}</code>\n"
+                        f"min_native: {config.min_native}"
+                    ),
+                )
+            else:
+                logger.info("Telegram 未配置 TELEGRAM_BOT_TOKEN/CHAT_ID，告警仅写日志")
             chains: list[tuple[EvmChain, MarketScanner]] = []
             mapping = (
                 ("ethereum", config.eth_rpc_url, config.eth_ws_url),
