@@ -177,6 +177,18 @@ def test_omit_html_log_filter_drops_webpage_records() -> None:
     assert filt.filter(ok_rec) is True
 
 
+def test_poa_extradata_is_transient() -> None:
+    class ExtraDataLengthError(Exception):
+        pass
+
+    exc = ExtraDataLengthError(
+        "The field extraData is 280 bytes, but should be 32. POA chain"
+    )
+    assert main._is_poa_extradata(exc) is True
+    assert main.classify_rpc_error(exc) == "transient"
+    assert main.is_transient_rpc_error(exc) is True
+
+
 def test_transient_vs_revert_classifier() -> None:
     class ContractLogicError(Exception):
         pass

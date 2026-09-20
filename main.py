@@ -33,6 +33,7 @@ from eth_utils import (
     to_checksum_address,
 )
 from web3 import AsyncWeb3
+from web3.middleware import ExtraDataToPOAMiddleware
 from web3.providers.persistent import WebSocketProvider
 from web3.providers.rpc import AsyncHTTPProvider
 from web3.types import HexBytes, RPCEndpoint, TxParams
@@ -476,6 +477,8 @@ def classify_rpc_error(exc: BaseException) -> str | None:
         return "nonjson"
     if _is_rate_limit_text(head):
         return "ratelimit"
+    if _is_poa_extradata(exc):
+        return "transient"
     needles = (
         "timeout",
         "timed out",
@@ -501,6 +504,30 @@ def classify_rpc_error(exc: BaseException) -> str | None:
 def _is_rate_limit_text(text: str) -> bool:
     lowered = text.lower()
     return "429" in lowered or "too many requests" in lowered or "rate limit" in lowered
+
+
+def _is_poa_extradata(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    head = _exc_head(exc).lower()
+    return "extradatalengtherror" in name or (
+        "extradata" in head and ("poa" in head or "should be 32" in head)
+    )
+
+
+def attach_poa_middleware(w3: AsyncWeb3) -> None:
+    """BNB and other POA chains return extraData > 32 bytes; required for get_block."""
+    onion = getattr(w3, "middleware_onion", None)
+    if onion is None:
+        return
+    try:
+        onion.inject(ExtraDataToPOAMiddleware, "poa", layer=0)
+    except ValueError:
+        return
+    except Exception:
+        try:
+            onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        except Exception:
+            return
 
 
 def is_transient_rpc_error(exc: BaseException) -> bool:
@@ -975,7 +1002,9 @@ class EvmChain:
             self.rpc_url,
             request_kwargs={"timeout": 25},
         )
-        return AsyncWeb3(provider)
+        w3 = AsyncWeb3(provider)
+        attach_poa_middleware(w3)
+        return w3
 
     async def attach_session(self) -> None:
         cache = getattr(self.w3.provider, "cache_async_session", None)
@@ -1702,8 +1731,12 @@ class MarketScanner:
                 last = await self._handle_new_head(last, head)
             except TransientRpcError:
                 self._logger.warning("%s 实时循环瞬时错误，重试", self.chain.alias)
-            except Exception:
-                self._logger.exception("%s 实时循环逻辑错误", self.chain.alias)
+            except Exception as exc:
+                kind = classify_rpc_error(exc)
+                if kind is not None:
+                    self.chain._log_rpc(kind)
+                    continue
+                self._logger.warning("%s 实时循环逻辑错误: %s", self.chain.alias, type(exc).__name__)
                 raise
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.config.poll_interval_sec)
