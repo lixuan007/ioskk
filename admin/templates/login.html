@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 - {{ app_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-box">
+      <h1>{{ app_name }}</h1>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for cat, msg in messages %}
+          <div class="flash {{ cat }}">{{ msg }}</div>
+        {% endfor %}
+      {% endwith %}
+      <form method="post">
+        <div class="field">
+          <label>账号</label>
+          <input type="text" name="name" value="{{ name or '' }}" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label>密码</label>
+          <input type="password" name="password" autocomplete="current-password" required>
+        </div>
+        <div class="field">
+          <label>验证码</label>
+          <div class="code-row">
+            <input type="text" name="code" placeholder="Telegram 验证码" autocomplete="one-time-code">
+            <button class="btn btn-ghost" type="submit" name="action" value="send_code">发送验证码</button>
+          </div>
+        </div>
+        <button class="btn btn-block" type="submit" name="action" value="login">登录</button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>
