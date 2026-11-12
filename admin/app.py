@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from flask import (
     Flask,
     flash,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -145,12 +146,22 @@ def login():
         password = request.form.get("password") or ""
         code = (request.form.get("code") or "").strip()
 
+        want_json = (
+            action == "send_code"
+            or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+            or "application/json" in (request.headers.get("Accept") or "")
+        )
+
         if not name or not password:
+            if want_json and action == "send_code":
+                return jsonify(ok=False, msg="请输入账号和密码")
             flash("请输入账号和密码", "error")
             return render_template("login.html", app_name=APP_NAME, name=name)
 
         op = get_operator(name)
         if not op or not check_password(password, op.get("password", "")):
+            if want_json and action == "send_code":
+                return jsonify(ok=False, msg="账号或密码错误")
             flash("账号或密码错误", "error")
             return render_template("login.html", app_name=APP_NAME, name=name)
 
@@ -159,10 +170,8 @@ def login():
             login_codes[name] = {"code": verify_code, "expire": time.time() + 300}
             msg = f"【{APP_NAME}】登录验证码：{verify_code}\n账号：{name}\n5分钟内有效"
             if send_telegram(msg):
-                flash("验证码已发送到 Telegram", "ok")
-            else:
-                flash("验证码发送失败，请检查 Telegram 配置", "error")
-            return render_template("login.html", app_name=APP_NAME, name=name)
+                return jsonify(ok=True, msg="验证码已发送到 Telegram")
+            return jsonify(ok=False, msg="验证码发送失败，请检查 Telegram 配置")
 
         # 登录
         cached = login_codes.get(name)
