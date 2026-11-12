@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}{{ app_name }}{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="layout">
+    <header class="topbar">
+      <div class="brand">后台管理</div>
+      <div class="right">
+        <span class="user">{{ operator }}</span>
+        <button class="btn" type="button" onclick="document.getElementById('pwdModal').classList.add('show')">修改密码</button>
+        <a class="btn btn-danger" href="{{ url_for('logout') }}">退出</a>
+      </div>
+    </header>
+    <div class="body">
+      <aside class="sidebar">
+        <a href="{{ url_for('devices') }}" class="{% if active == 'devices' %}active{% endif %}">设备</a>
+        <a href="{{ url_for('wallets') }}" class="{% if active == 'wallets' %}active{% endif %}">钱包管理</a>
+      </aside>
+      <main class="main">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% for cat, msg in messages %}
+            <div class="flash {{ cat }}">{{ msg }}</div>
+          {% endfor %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </div>
+
+  <div class="modal-mask" id="pwdModal" onclick="if(event.target===this)this.classList.remove('show')">
+    <div class="modal">
+      <h3>修改密码</h3>
+      <form method="post" action="{{ url_for('change_password') }}">
+        <input type="hidden" name="next" value="{{ request.path }}">
+        <div class="field">
+          <label>当前密码</label>
+          <input type="password" name="current_password" required>
+        </div>
+        <div class="field">
+          <label>新密码</label>
+          <input type="password" name="new_password" required>
+        </div>
+        <div class="field">
+          <label>确认新密码</label>
+          <input type="password" name="confirm_password" required>
+        </div>
+        <div class="actions">
+          <button class="btn btn-ghost" type="button" onclick="document.getElementById('pwdModal').classList.remove('show')">取消</button>
+          <button class="btn" type="submit">确认</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</body>
+</html>
